@@ -161,10 +161,10 @@
 	"attribute_vopersonverifiedemail": {
 		"en": "Verified mail"
 	},
-	"attribute_voPersonCertificateIssuerDN": {
+	"attribute_vopersoncertificateissuerdn": {
 		"en": "Issuer Distinguished Name (DN) of person's X.509 certificate"
 	},
-	"attribute_voPersonCertificateDN": {
+	"attribute_vopersoncertificatedn": {
 		"en": "Subject Distinguished Name (DN) of person's X.509 certificate"
 	}
 }
