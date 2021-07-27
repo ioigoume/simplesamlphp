@@ -166,5 +166,8 @@
 	},
 	"attribute_vopersoncertificatedn": {
 		"en": "Subject Distinguished Name (DN) of person's X.509 certificate"
+	},
+	"attribute_distinguishedname": {
+		"en": "Subject Distinguished Name (DN) of person's X.509 certificate"
 	}
 }
