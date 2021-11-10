@@ -51,13 +51,13 @@
 		"en": "Service-specific pseudonymous ID at home organization"
 	},
 	"attribute_edupersonprincipalname": {
-		"en": "Person's principal name at home organization"
+		"en": "Community User Identifier (eduPersonPrincipalName)"
 	},
 	"attribute_edupersonuniqueid": {
-		"en": "Person's non-reassignable, persistent pseudonymous ID at home organization"
+		"en": "Community User Identifier (eduPersonUniqueId)"
 	},
 	"attribute_subject_id": {
-		"en": "Pseudonymous ID at home organization"
+		"en": "Community User Identifier (subject-id)"
 	},
 	"attribute_edupersonorcid": {
 		"en": "ORCID researcher identifiers"
@@ -157,6 +157,12 @@
 	},
 	"attribute_vopersonexternalid": {
 		"en": "Identifier at home organization"
+	},
+	"attribute_vopersonid": {
+		"en": "Community User Identifier (voPersonID)"
+	},
+	"attribute_vopersonscopedaffiliation": {
+		"en": "Affiliation within the community or research infrastructure"
 	},
 	"attribute_vopersonverifiedemail": {
 		"en": "Verified mail"
