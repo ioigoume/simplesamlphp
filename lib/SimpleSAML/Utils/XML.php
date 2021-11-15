@@ -110,6 +110,20 @@ class XML
 
         // see if debugging is enabled for SAML messages
         $debug = Configuration::getInstance()->getArrayize('debug', ['saml' => false]);
+        $samlLevel = Configuration::getInstance()->getArrayize('debug', ['saml.level' => Logger::DEBUG]);
+
+        $callback = [Logger::class];
+        $logLevels = [
+            Logger::EMERG => 'emergency',
+            Logger::ALERT => 'alert',
+            Logger::CRIT => 'critical',
+            Logger::ERR => 'error',
+            Logger::WARNING => 'warning',
+            Logger::NOTICE => 'notice',
+            Logger::INFO => 'info',
+            Logger::DEBUG => 'debug',
+        ];
+        $callback[] = $logLevels[$samlLevel['saml.level']];
 
         if (
             !(in_array('saml', $debug, true) // implicitly enabled
@@ -130,16 +144,16 @@ class XML
 
         switch ($type) {
             case 'in':
-                Logger::debug('Received message:');
+                call_user_func($callback, 'Received message:');
                 break;
             case 'out':
-                Logger::debug('Sending message:');
+                call_user_func($callback, 'Sending message:');
                 break;
             case 'decrypt':
-                Logger::debug('Decrypted message:');
+                call_user_func($callback, 'Decrypted message:');
                 break;
             case 'encrypt':
-                Logger::debug('Encrypted message:');
+                call_user_func($callback, 'Encrypted message:');
                 break;
             default:
                 assert(false);
@@ -147,7 +161,7 @@ class XML
 
         $str = self::formatXMLString($message);
         foreach (explode("\n", $str) as $line) {
-            Logger::debug($line);
+            call_user_func($callback, $line);
         }
     }
 
