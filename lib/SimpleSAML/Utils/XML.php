@@ -110,7 +110,9 @@ class XML
 
         // see if debugging is enabled for SAML messages
         $debug = Configuration::getInstance()->getArrayize('debug', ['saml' => false]);
-        $samlLevel = Configuration::getInstance()->getArrayize('debug', ['saml.level' => Logger::DEBUG]);
+        if (!array_key_exists('saml.level', $debug)) {
+            $debug['saml.level'] = Logger::DEBUG;
+        }
 
         $callback = [Logger::class];
         $logLevels = [
@@ -123,7 +125,7 @@ class XML
             Logger::INFO => 'info',
             Logger::DEBUG => 'debug',
         ];
-        $callback[] = $logLevels[$samlLevel['saml.level']];
+        $callback[] = $logLevels[$debug['saml.level']];
 
         if (
             !(in_array('saml', $debug, true) // implicitly enabled
