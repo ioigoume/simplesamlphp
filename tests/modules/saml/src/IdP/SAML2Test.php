@@ -6,6 +6,8 @@ namespace SimpleSAML\Test\Module\saml\IdP;
 
 use InvalidArgumentException;
 use PHPUnit\Framework\Attributes\CoversClass;
+use ReflectionMethod;
+use SAML2\Constants;
 use SimpleSAML\Configuration;
 use SimpleSAML\Error\Exception;
 use SimpleSAML\IdP;
@@ -48,6 +50,102 @@ class SAML2Test extends ClearStateTestCase
         'saml:Extensions' => null,
         'saml:RequestedAuthnContext' => null,
     ];
+
+
+    private function buildAssertionForState(array $state): \SAML2\Assertion
+    {
+        $idpMetadata = Configuration::loadFromArray(
+            ['entityid' => 'https://idp.example'],
+            'test-idp-metadata',
+        );
+        $spMetadata = Configuration::loadFromArray(
+            [
+                'entityid' => 'https://sp.example',
+                'saml20.sign.assertion' => false,
+            ],
+            'test-sp-metadata',
+        );
+
+        $method = new ReflectionMethod(SAML2::class, 'buildAssertion');
+        $method->setAccessible(true);
+
+        /** @var \SAML2\Assertion $assertion */
+        $assertion = $method->invoke(null, $idpMetadata, $spMetadata, $state);
+
+        return $assertion;
+    }
+
+
+    public function testProxyFallbackPrefersUpstreamAuthnContextClassRef(): void
+    {
+        $state = [
+            'Attributes' => [],
+            'saml:ConsumerURL' => 'https://sp.example/acs',
+            'saml:Binding' => Constants::BINDING_HTTP_POST,
+            'saml:RequestId' => 'request-id',
+            'IdPMetadata' => ['entityid' => 'https://idp.example'],
+
+            // Proxy state from upstream IdP.
+            'saml:sp:AuthnContext' => 'https://refeds.org/profile/mfa',
+            'saml:AuthnInstant' => 1234567890,
+
+            // Proxy requested context and ladder.
+            'saml:AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+            'saml:AuthnContextClassRefFallback' => [
+                'https://refeds.org/profile/mfa/phr',
+                'https://refeds.org/profile/mfa',
+                '',
+            ],
+        ];
+
+        $assertion = $this->buildAssertionForState($state);
+        $this->assertSame('https://refeds.org/profile/mfa', $assertion->getAuthnContextClassRef());
+        $this->assertSame(1234567890, $assertion->getAuthnInstant());
+    }
+
+
+    public function testProxyFallbackFirstRungPassesUpstreamAuthnContextAndInstant(): void
+    {
+        $state = [
+            'Attributes' => [],
+            'saml:ConsumerURL' => 'https://sp.example/acs',
+            'saml:Binding' => Constants::BINDING_HTTP_POST,
+            'saml:RequestId' => 'request-id',
+            'IdPMetadata' => ['entityid' => 'https://idp.example'],
+
+            'saml:sp:AuthnContext' => 'https://refeds.org/profile/mfa/phr',
+            'saml:AuthnInstant' => 1234567891,
+
+            'saml:AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+            'saml:AuthnContextClassRefFallback' => [
+                'https://refeds.org/profile/mfa/phr',
+                'https://refeds.org/profile/mfa',
+                '',
+            ],
+        ];
+
+        $assertion = $this->buildAssertionForState($state);
+        $this->assertSame('https://refeds.org/profile/mfa/phr', $assertion->getAuthnContextClassRef());
+        $this->assertSame(1234567891, $assertion->getAuthnInstant());
+    }
+
+
+    public function testOrdinaryProxyFlowDoesNotUseFallbackAuthnInstant(): void
+    {
+        $state = [
+            'Attributes' => [],
+            'saml:ConsumerURL' => 'https://sp.example/acs',
+            'saml:Binding' => Constants::BINDING_HTTP_POST,
+            'saml:RequestId' => 'request-id',
+            'IdPMetadata' => ['entityid' => 'https://idp.example'],
+            'saml:sp:AuthnContext' => 'https://refeds.org/profile/mfa',
+            'saml:AuthnInstant' => 1234567890,
+            'AuthnInstant' => 1234567891,
+        ];
+
+        $assertion = $this->buildAssertionForState($state);
+        $this->assertSame(1234567891, $assertion->getAuthnInstant());
+    }
 
 
     /**

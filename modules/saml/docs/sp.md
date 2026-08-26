@@ -147,19 +147,33 @@ The following attributes are available:
     One example of usage could be if the IdP supports both username/password authentication as well as software-PKI.
     Set this to a string for one class identifier or an array of requested class identifiers.
 
+:   When `AuthnContextClassRefFallback` is configured, `AuthnContextClassRef` must be a single non-empty string.
+
 `AuthnContextClassRefFallback`
 :   A prioritized array of fallback authentication contexts to use if the IdP
     responds with a `NoAuthnContext` error. This is particularly useful in a
     proxy scenario (e.g., requesting REFEDS MFA phishing-resistant, then
     falling back to standard MFA if the user doesn't have a hardware key).
-    Each element in the array can be a single string (representing one context class)
-    or an array of strings (if requesting multiple classes simultaneously).
-    An empty string or an empty array as the last element allows a final fallback
+    Each element in the array must be a single string (representing one context class),
+    and the list may contain at most two fallback rungs (three total attempts including
+    the initial `AuthnContextClassRef`).
+    The final element may be the empty string (`''`) to allow a final fallback
     to standard login without an explicit context.
 
-:   Note that this option also exists in the IdP-remote metadata, and
-    any value in the IdP-remote metadata overrides the one configured
-    in the SP configuration.
+:   The empty string is only allowed as the final element and duplicate values are not allowed.
+    Setting this option to an empty array (`[]`) disables fallback retries and results in a single attempt.
+
+:   Note that this option also exists in the IdP-remote metadata.
+    If either `AuthnContextClassRef` or `AuthnContextClassRefFallback` is set in the selected IdP-remote metadata,
+    the pair is taken from the IdP-remote metadata and SP defaults are not used.
+
+:   Each ladder attempt sends exactly one context with `Comparison="exact"`. A retry is made only for a
+    cryptographically validated `Responder` / `NoAuthnContext` response correlated to the current request.
+    An explicit `RequestedAuthnContext` from a downstream SP disables the configured ladder for that transaction.
+
+:   Per REFEDS guidance, a requested context does not prove which authentication was performed. Authorization
+    decisions must trust and evaluate the `AuthnContextClassRef` actually returned by the upstream IdP; proxy
+    responses for fallback-backed transactions report that achieved context.
 
 `AuthnContextComparison`
 :   The Comparison attribute of the AuthnContext that will be sent in the login request.

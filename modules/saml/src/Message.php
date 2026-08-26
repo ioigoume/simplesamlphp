@@ -733,6 +733,95 @@ class Message
 
 
     /**
+     * Validate an error response for fallback authentication retry.
+     *
+     * Validates that the error Response:
+     * - is non-success
+     * - matches the ACS destination URL (if destination is specified)
+     * - matches the expected issuer
+     * - is signed by the IdP (valid XML signature)
+     * - matches the expected request ID (InResponseTo)
+     *
+     * @param \SimpleSAML\Configuration $spMetadata The metadata of the service provider.
+     * @param \SimpleSAML\Configuration $idpMetadata The metadata of the identity provider.
+     * @param \SAML2\Response $response The error response.
+     * @param string|null $expectedRequestId The AuthnRequest ID that this Response must correlate with.
+     * @param string|null $expectedIssuer The expected entityID of the IdP.
+     *
+     * @throws \SimpleSAML\Error\Exception if the response is invalid or validation fails.
+     * @throws \Exception if the destination does not match.
+     */
+    public static function validateFallbackErrorResponse(
+        Configuration $spMetadata,
+        Configuration $idpMetadata,
+        Response $response,
+        ?string $expectedRequestId = null,
+        ?string $expectedIssuer = null,
+    ): void {
+        if ($response->isSuccess()) {
+            throw new SSP_Error\Exception('Expected error response for fallback validation, but response status was success.');
+        }
+
+        // Validate Response-element destination
+        $httpUtils = new Utils\HTTP();
+        $currentURL = $httpUtils->getSelfURLNoQuery();
+        $msgDestination = $response->getDestination();
+        if ($msgDestination === null) {
+            throw new SSP_Error\Exception('Fallback error response must contain Destination.');
+        }
+        if ($msgDestination !== $currentURL) {
+            throw new \Exception(sprintf(
+                'Destination in response doesn\'t match the current URL. Destination is "%s", current URL is "%s".',
+                $msgDestination,
+                $currentURL,
+            ));
+        }
+
+        // Validate issuer
+        $issuer = $response->getIssuer();
+        $issuerValue = $issuer?->getValue();
+        if ($expectedIssuer !== null) {
+            if ($issuerValue === null) {
+                throw new SSP_Error\Exception(sprintf(
+                    'Missing issuer in Response; cannot enforce expected issuer %s.',
+                    var_export($expectedIssuer, true),
+                ));
+            }
+
+            if ($issuerValue !== $expectedIssuer) {
+                throw new SSP_Error\Exception(sprintf(
+                    'Issuer mismatch. Expected %s, got %s.',
+                    var_export($expectedIssuer, true),
+                    var_export($issuerValue, true),
+                ));
+            }
+        }
+
+        // Validate XML signature (must be signed by IdP)
+        $responseSigned = self::checkSign($idpMetadata, $response);
+        if ($responseSigned !== true) {
+            throw new SSP_Error\Exception('Fallback error response must be signed.');
+        }
+
+        // Validate InResponseTo
+        $responseInResponseTo = $response->getInResponseTo();
+        if ($expectedRequestId === null || $expectedRequestId === '') {
+            throw new SSP_Error\Exception('Missing expected request ID for solicited fallback response validation.');
+        }
+        if ($responseInResponseTo === null) {
+            throw new SSP_Error\Exception('Fallback error response must contain InResponseTo.');
+        }
+        if ($responseInResponseTo !== $expectedRequestId) {
+            throw new SSP_Error\Exception(sprintf(
+                'Response InResponseTo does not match expected request ID. Expected %s, got %s.',
+                var_export($expectedRequestId, true),
+                var_export($responseInResponseTo, true),
+            ));
+        }
+    }
+
+
+    /**
      * Process an assertion in a response.
      *
      * @param \SimpleSAML\Configuration $spMetadata The metadata of the service provider.

@@ -48,6 +48,11 @@ $config = [
         /*
          * The initially requested authentication context (e.g., for REFEDS MFA).
          * If the IdP cannot fulfill this context, it will return a NoAuthnContext error.
+         *
+         * This setting is the default. For IdP-specific overrides, configure
+         * AuthnContextClassRef/AuthnContextClassRefFallback in metadata/saml20-idp-remote.php.
+         * If either option is present for the selected IdP, both options are taken from
+         * IdP-remote metadata and these defaults are not inherited.
          */
         //'AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
 
@@ -56,10 +61,21 @@ $config = [
          * responds with a NoAuthnContext error. This is particularly useful in a
          * proxy scenario (e.g., requesting REFEDS MFA phishing-resistant, then
          * falling back to standard MFA if the user doesn't have a hardware key).
-         * Each element in the array can be a single string (representing one context class)
-         * or an array of strings (if requesting multiple classes simultaneously).
-         * An empty string or an empty array as the last element allows a final fallback
-         * to standard login without an explicit context.
+         *
+         * Constraints:
+         * - AuthnContextClassRef must be a single non-empty string when using fallback.
+         * - Each element in the array must be a single string (representing one context class).
+         * - At most 2 fallback rungs are allowed (maximum 3 total attempts).
+         * - Duplicate values are not allowed.
+         * - The empty string ('') is only allowed as the last element, to allow a final fallback
+         *   to standard login without an explicit context.
+         * - An explicit empty array ([]) disables fallback retries and results in a single attempt.
+         * - Each attempt requests exactly one context with Comparison="exact". A retry occurs only
+         *   after a signed, correlated Responder/NoAuthnContext response has been validated.
+         * - An explicit RequestedAuthnContext from a downstream SP disables this fallback ladder.
+         *
+         * Per REFEDS guidance, the requested context is not proof of the authentication performed.
+         * Trust and evaluate the AuthnContextClassRef returned by the upstream IdP before granting access.
          */
         /*
         'AuthnContextClassRefFallback' => [

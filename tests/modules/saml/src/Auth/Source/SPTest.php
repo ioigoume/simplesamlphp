@@ -13,6 +13,7 @@ use SAML2\Utils;
 use SAML2\XML\saml\NameID;
 use SimpleSAML\Assert\AssertionFailedException;
 use SimpleSAML\Configuration;
+use SimpleSAML\Error\ConfigurationError;
 use SimpleSAML\Error\Exception;
 use SimpleSAML\Module\saml\Auth\Source\SP;
 use SimpleSAML\SAML2\Constants;
@@ -281,36 +282,39 @@ class SPTest extends ClearStateTestCase
 
 
     /**
-     * Test that SP properly initializes the fallback list for AuthnContextClassRef
-     * from IdP configuration into the state array.
+     * Test that SP properly initializes both the AuthnContextClassRef
+     * and the fallback list from SP AuthSource configuration into the state array.
      */
-    public function testSPInitializesAuthnContextFallback(): void
+    public function testAuthnContextClassRefFallbackFromSPMetadata(): void
     {
         $info = ['AuthId' => 'default-sp'];
-        $config = ['entityID' => 'urn:x-simplesamlphp:example-sp'];
+        $config = [
+            'entityID' => 'urn:x-simplesamlphp:example-sp',
+            'AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+            'AuthnContextClassRefFallback' => [
+                'https://refeds.org/profile/mfa',
+                '',
+            ],
+        ];
         $as = new SpTester($info, $config);
 
-        $idpConfig = $this->idpConfigArray;
-        $idpConfig['AuthnContextClassRefFallback'] = [
-            [
-                'https://refeds.org/profile/mfa',
-                'https://refeds.org/profile/sfa',
-            ],
-            'https://refeds.org/profile/mfa',
-            [],
-        ];
-        $idpMetadata = new Configuration($idpConfig, 'test-idp');
-
-        $state = [
-            'saml:AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
-        ];
+        $idpMetadata = new Configuration($this->idpConfigArray, 'test-idp');
 
         try {
-            $as->startSSO2Test($idpMetadata, $state);
+            $as->startSSO2Test($idpMetadata, []);
             $this->fail('Expected ExitTestException');
         } catch (ExitTestException $e) {
             $r = $e->getTestResult();
+            /** @var \SAML2\AuthnRequest $ar */
             $ar = $r['ar'];
+
+            $requestedContext = $ar->getRequestedAuthnContext();
+            $this->assertIsArray($requestedContext);
+            $this->assertEquals(
+                ['https://refeds.org/profile/mfa/phr'],
+                $requestedContext['AuthnContextClassRef'],
+            );
+            $this->assertEquals('exact', $requestedContext['Comparison']);
 
             // Look up the state by the saved ID
             $savedState = \SimpleSAML\Auth\State::loadState($ar->getId(), 'saml:sp:sso');
@@ -318,12 +322,8 @@ class SPTest extends ClearStateTestCase
             $this->assertArrayHasKey('saml:AuthnContextClassRefFallback', $savedState);
             $this->assertEquals(
                 [
-                    [
-                        'https://refeds.org/profile/mfa',
-                        'https://refeds.org/profile/sfa',
-                    ],
                     'https://refeds.org/profile/mfa',
-                    [],
+                    '',
                 ],
                 $savedState['saml:AuthnContextClassRefFallback'],
             );
@@ -332,27 +332,19 @@ class SPTest extends ClearStateTestCase
 
 
     /**
-     * Test that SP properly initializes both the AuthnContextClassRef
-     * and the fallback list from IdP configuration.
+     * Test that IdP remote metadata can configure the fallback policy.
      */
-    public function testAuthnContextClassRefAndFallbackFromIdPMetadata(): void
+    public function testAuthnContextClassRefAndFallbackIgnoresIdPMetadata(): void
     {
         $info = ['AuthId' => 'default-sp'];
         $config = ['entityID' => 'urn:x-simplesamlphp:example-sp'];
         $as = new SpTester($info, $config);
 
         $idpConfig = $this->idpConfigArray;
-        $idpConfig['AuthnContextClassRef'] = [
-            'http://example.com/myAuthnContextClassRef1',
-            'http://example.com/myAuthnContextClassRef2',
-        ];
+        $idpConfig['AuthnContextClassRef'] = 'https://refeds.org/profile/mfa/phr';
         $idpConfig['AuthnContextClassRefFallback'] = [
-            [
-                'https://refeds.org/profile/mfa',
-                'https://refeds.org/profile/sfa',
-            ],
             'https://refeds.org/profile/mfa',
-            [],
+            '',
         ];
         $idpMetadata = new Configuration($idpConfig, 'test-idp');
 
@@ -367,29 +359,421 @@ class SPTest extends ClearStateTestCase
             $requestedContext = $ar->getRequestedAuthnContext();
             $this->assertIsArray($requestedContext);
             $this->assertEquals(
-                [
-                    'http://example.com/myAuthnContextClassRef1',
-                    'http://example.com/myAuthnContextClassRef2',
-                ],
+                ['https://refeds.org/profile/mfa/phr'],
                 $requestedContext['AuthnContextClassRef'],
             );
+            $this->assertEquals('exact', $requestedContext['Comparison']);
 
-            // Look up the state by the saved ID
             $savedState = \SimpleSAML\Auth\State::loadState($ar->getId(), 'saml:sp:sso');
-
-            $this->assertArrayHasKey('saml:AuthnContextClassRefFallback', $savedState);
             $this->assertEquals(
-                [
-                    [
-                        'https://refeds.org/profile/mfa',
-                        'https://refeds.org/profile/sfa',
-                    ],
-                    'https://refeds.org/profile/mfa',
-                    [],
-                ],
+                ['https://refeds.org/profile/mfa', ''],
                 $savedState['saml:AuthnContextClassRefFallback'],
             );
         }
+    }
+
+
+    /**
+     * Test atomic override: selected IdP metadata overrides SP authsource defaults and downstream metadata.
+     */
+    public function testAuthnContextClassRefAndFallbackDownstreamSPOverride(): void
+    {
+        $info = ['AuthId' => 'default-sp'];
+        $config = [
+            'entityID' => 'urn:x-simplesamlphp:example-sp',
+            'AuthnContextClassRef' => 'urn:global:initial',
+            'AuthnContextClassRefFallback' => ['urn:global:fallback', ''],
+        ];
+        $as = new SpTester($info, $config);
+        $idpConfig = $this->idpConfigArray;
+        $idpConfig['AuthnContextClassRef'] = 'urn:idp:initial';
+        $idpConfig['AuthnContextClassRefFallback'] = ['urn:idp:fallback', ''];
+        $idpMetadata = new Configuration($idpConfig, 'test-idp');
+
+        $state = [
+            'SPMetadata' => [
+                'entityid' => 'urn:downstream:sp',
+                'AuthnContextClassRef' => 'urn:downstream:initial',
+                'AuthnContextClassRefFallback' => ['urn:downstream:fallback', ''],
+            ],
+        ];
+
+        try {
+            $as->startSSO2Test($idpMetadata, $state);
+            $this->fail('Expected ExitTestException');
+        } catch (ExitTestException $e) {
+            $r = $e->getTestResult();
+            /** @var \SAML2\AuthnRequest $ar */
+            $ar = $r['ar'];
+
+            $requestedContext = $ar->getRequestedAuthnContext();
+            $this->assertIsArray($requestedContext);
+            $this->assertEquals(['urn:idp:initial'], $requestedContext['AuthnContextClassRef']);
+            $this->assertEquals('exact', $requestedContext['Comparison']);
+
+            $savedState = \SimpleSAML\Auth\State::loadState($ar->getId(), 'saml:sp:sso');
+            $this->assertEquals(['urn:idp:fallback', ''], $savedState['saml:AuthnContextClassRefFallback']);
+        }
+    }
+
+
+    /**
+     * Test atomic override: an explicitly empty selected-IdP fallback list disables global retries.
+     */
+    public function testAuthnContextClassRefDownstreamSPOverrideWithEmptyFallback(): void
+    {
+        $info = ['AuthId' => 'default-sp'];
+        $config = [
+            'entityID' => 'urn:x-simplesamlphp:example-sp',
+            'AuthnContextClassRef' => 'urn:global:initial',
+            'AuthnContextClassRefFallback' => ['urn:global:fallback', ''],
+        ];
+        $as = new SpTester($info, $config);
+        $idpConfig = $this->idpConfigArray;
+        $idpConfig['AuthnContextClassRef'] = 'urn:idp:initial';
+        $idpConfig['AuthnContextClassRefFallback'] = [];
+        $idpConfig['AuthnContextComparison'] = 'minimum';
+        $idpMetadata = new Configuration($idpConfig, 'test-idp');
+
+        $state = [
+            'SPMetadata' => [
+                'entityid' => 'urn:downstream:sp',
+                'AuthnContextClassRef' => 'urn:downstream:initial',
+                'AuthnContextClassRefFallback' => [],
+            ],
+        ];
+
+        try {
+            $as->startSSO2Test($idpMetadata, $state);
+            $this->fail('Expected ExitTestException');
+        } catch (ExitTestException $e) {
+            $r = $e->getTestResult();
+            /** @var \SAML2\AuthnRequest $ar */
+            $ar = $r['ar'];
+
+            $requestedContext = $ar->getRequestedAuthnContext();
+            $this->assertIsArray($requestedContext);
+            $this->assertEquals(['urn:idp:initial'], $requestedContext['AuthnContextClassRef']);
+            $this->assertEquals('minimum', $requestedContext['Comparison']);
+
+            $savedState = \SimpleSAML\Auth\State::loadState($ar->getId(), 'saml:sp:sso');
+            $this->assertArrayNotHasKey('saml:AuthnContextClassRefFallback', $savedState);
+        }
+    }
+
+
+    /**
+     * Test atomic override: a selected-IdP context does not inherit global fallback retries.
+     */
+    public function testAuthnContextClassRefDownstreamSPOverrideWithoutFallback(): void
+    {
+        $info = ['AuthId' => 'default-sp'];
+        $config = [
+            'entityID' => 'urn:x-simplesamlphp:example-sp',
+            'AuthnContextClassRef' => 'urn:global:initial',
+            'AuthnContextClassRefFallback' => ['urn:global:fallback', ''],
+        ];
+        $as = new SpTester($info, $config);
+        $idpConfig = $this->idpConfigArray;
+        $idpConfig['AuthnContextClassRef'] = 'urn:idp:initial';
+        $idpMetadata = new Configuration($idpConfig, 'test-idp');
+
+        $state = [
+            'SPMetadata' => [
+                'entityid' => 'urn:downstream:sp',
+                'AuthnContextClassRef' => 'urn:downstream:initial',
+            ],
+        ];
+
+        try {
+            $as->startSSO2Test($idpMetadata, $state);
+            $this->fail('Expected ExitTestException');
+        } catch (ExitTestException $e) {
+            $r = $e->getTestResult();
+            /** @var \SAML2\AuthnRequest $ar */
+            $ar = $r['ar'];
+
+            $requestedContext = $ar->getRequestedAuthnContext();
+            $this->assertIsArray($requestedContext);
+            $this->assertEquals(['urn:idp:initial'], $requestedContext['AuthnContextClassRef']);
+
+            $savedState = \SimpleSAML\Auth\State::loadState($ar->getId(), 'saml:sp:sso');
+            $this->assertArrayNotHasKey('saml:AuthnContextClassRefFallback', $savedState);
+        }
+    }
+
+
+    /**
+     * Test stock precedence when no fallback policy is configured.
+     */
+    public function testAuthnContextClassRefStateOverridesAuthsourceDefaultWithoutFallback(): void
+    {
+        $info = ['AuthId' => 'default-sp'];
+        $config = [
+            'entityID' => 'urn:x-simplesamlphp:example-sp',
+            'AuthnContextClassRef' => 'urn:authsource:default',
+            'AuthnContextComparison' => 'minimum',
+        ];
+        $as = new SpTester($info, $config);
+        $idpMetadata = new Configuration($this->idpConfigArray, 'test-idp');
+        $state = [
+            'saml:AuthnContextClassRef' => ['urn:request:first', 'urn:request:second'],
+            'saml:AuthnContextComparison' => 'better',
+        ];
+
+        try {
+            $as->startSSO2Test($idpMetadata, $state);
+            $this->fail('Expected ExitTestException');
+        } catch (ExitTestException $e) {
+            $r = $e->getTestResult();
+            /** @var \SAML2\AuthnRequest $ar */
+            $ar = $r['ar'];
+
+            $requestedContext = $ar->getRequestedAuthnContext();
+            $this->assertIsArray($requestedContext);
+            $this->assertEquals(
+                ['urn:request:first', 'urn:request:second'],
+                $requestedContext['AuthnContextClassRef'],
+            );
+            $this->assertEquals('better', $requestedContext['Comparison']);
+        }
+    }
+
+
+    /**
+     * Test that explicitly disabling fallback retains the prebuilt authsource comparison.
+     */
+    public function testAuthnContextClassRefKeepsAuthsourceComparisonWithoutFallback(): void
+    {
+        $info = ['AuthId' => 'default-sp'];
+        $config = [
+            'entityID' => 'urn:x-simplesamlphp:example-sp',
+            'AuthnContextClassRef' => 'urn:authsource:default',
+            'AuthnContextClassRefFallback' => [],
+            'AuthnContextComparison' => 'minimum',
+        ];
+        $as = new SpTester($info, $config);
+        $idpMetadata = new Configuration($this->idpConfigArray, 'test-idp');
+
+        try {
+            $as->startSSO2Test($idpMetadata, []);
+            $this->fail('Expected ExitTestException');
+        } catch (ExitTestException $e) {
+            $r = $e->getTestResult();
+            /** @var \SAML2\AuthnRequest $ar */
+            $ar = $r['ar'];
+
+            $requestedContext = $ar->getRequestedAuthnContext();
+            $this->assertIsArray($requestedContext);
+            $this->assertEquals(['urn:authsource:default'], $requestedContext['AuthnContextClassRef']);
+            $this->assertEquals('minimum', $requestedContext['Comparison']);
+        }
+    }
+
+
+    /**
+     * Test absent-context gating: explicit downstream RequestedAuthnContext suppresses fallback initialization.
+     */
+    public function testAuthnContextClassRefFallbackGatedByDownstreamRequestedContext(): void
+    {
+        $info = ['AuthId' => 'default-sp'];
+        $config = [
+            'entityID' => 'urn:x-simplesamlphp:example-sp',
+            'proxymode.passAuthnContextClassRef' => true,
+            'AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+            'AuthnContextClassRefFallback' => ['https://refeds.org/profile/mfa', ''],
+        ];
+        $as = new SpTester($info, $config);
+        $idpMetadata = new Configuration($this->idpConfigArray, 'test-idp');
+
+        $state = [
+            'saml:RequestedAuthnContext' => [
+                'AuthnContextClassRef' => ['urn:downstream:explicit'],
+                'Comparison' => 'minimum',
+            ],
+        ];
+
+        try {
+            $as->startSSO2Test($idpMetadata, $state);
+            $this->fail('Expected ExitTestException');
+        } catch (ExitTestException $e) {
+            $r = $e->getTestResult();
+            /** @var \SAML2\AuthnRequest $ar */
+            $ar = $r['ar'];
+
+            $requestedContext = $ar->getRequestedAuthnContext();
+            $this->assertIsArray($requestedContext);
+            $this->assertEquals(['urn:downstream:explicit'], $requestedContext['AuthnContextClassRef']);
+            $this->assertEquals('minimum', $requestedContext['Comparison']);
+
+            $savedState = \SimpleSAML\Auth\State::loadState($ar->getId(), 'saml:sp:sso');
+            $this->assertArrayNotHasKey('saml:AuthnContextClassRefFallback', $savedState);
+        }
+    }
+
+
+    /**
+     * Test that fallback requests enforce Comparison="exact" even if state or IdP specifies another comparison.
+     */
+    public function testAuthnContextClassRefFallbackEnforcesExactComparison(): void
+    {
+        $info = ['AuthId' => 'default-sp'];
+        $config = [
+            'entityID' => 'urn:x-simplesamlphp:example-sp',
+            'AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+            'AuthnContextClassRefFallback' => ['https://refeds.org/profile/mfa', ''],
+        ];
+        $as = new SpTester($info, $config);
+
+        $idpConfig = $this->idpConfigArray;
+        $idpConfig['AuthnContextComparison'] = 'better';
+        $idpMetadata = new Configuration($idpConfig, 'test-idp');
+
+        $state = [
+            'saml:AuthnContextComparison' => 'minimum',
+        ];
+
+        try {
+            $as->startSSO2Test($idpMetadata, $state);
+            $this->fail('Expected ExitTestException');
+        } catch (ExitTestException $e) {
+            $r = $e->getTestResult();
+            /** @var \SAML2\AuthnRequest $ar */
+            $ar = $r['ar'];
+
+            $requestedContext = $ar->getRequestedAuthnContext();
+            $this->assertIsArray($requestedContext);
+            $this->assertEquals('exact', $requestedContext['Comparison']);
+        }
+    }
+
+
+    /**
+     * Test ladder validation: reject more than 2 fallback rungs (maximum 3 total attempts).
+     */
+    public function testLadderRejectsExcessiveRungs(): void
+    {
+        $info = ['AuthId' => 'default-sp'];
+        $config = [
+            'entityID' => 'urn:x-simplesamlphp:example-sp',
+            'AuthnContextClassRef' => 'urn:step1',
+            'AuthnContextClassRefFallback' => [
+                'urn:step2',
+                'urn:step3',
+                '',
+            ],
+        ];
+        $as = new SpTester($info, $config);
+        $idpMetadata = new Configuration($this->idpConfigArray, 'test-idp');
+
+        $this->expectException(ConfigurationError::class);
+        $as->startSSO2Test($idpMetadata, []);
+    }
+
+
+    /**
+     * Test ladder validation: reject fallback rungs containing multiple contexts.
+     */
+    public function testLadderRejectsMultiContextRungs(): void
+    {
+        $info = ['AuthId' => 'default-sp'];
+        $config = [
+            'entityID' => 'urn:x-simplesamlphp:example-sp',
+            'AuthnContextClassRef' => 'urn:step1',
+            'AuthnContextClassRefFallback' => [
+                ['urn:step2a', 'urn:step2b'],
+                '',
+            ],
+        ];
+        $as = new SpTester($info, $config);
+        $idpMetadata = new Configuration($this->idpConfigArray, 'test-idp');
+
+        $this->expectException(ConfigurationError::class);
+        $as->startSSO2Test($idpMetadata, []);
+    }
+
+
+    /**
+     * Test ladder validation: reject non-terminal empty context.
+     */
+    public function testLadderRejectsNonTerminalEmptyRung(): void
+    {
+        $info = ['AuthId' => 'default-sp'];
+        $config = [
+            'entityID' => 'urn:x-simplesamlphp:example-sp',
+            'AuthnContextClassRef' => 'urn:step1',
+            'AuthnContextClassRefFallback' => [
+                '',
+                'urn:step3',
+            ],
+        ];
+        $as = new SpTester($info, $config);
+        $idpMetadata = new Configuration($this->idpConfigArray, 'test-idp');
+
+        $this->expectException(ConfigurationError::class);
+        $as->startSSO2Test($idpMetadata, []);
+    }
+
+
+    /**
+     * Test ladder validation: reject duplicate contexts.
+     */
+    public function testLadderRejectsDuplicateContexts(): void
+    {
+        $info = ['AuthId' => 'default-sp'];
+        $config = [
+            'entityID' => 'urn:x-simplesamlphp:example-sp',
+            'AuthnContextClassRef' => 'urn:step1',
+            'AuthnContextClassRefFallback' => [
+                'urn:step1',
+                '',
+            ],
+        ];
+        $as = new SpTester($info, $config);
+        $idpMetadata = new Configuration($this->idpConfigArray, 'test-idp');
+
+        $this->expectException(ConfigurationError::class);
+        $as->startSSO2Test($idpMetadata, []);
+    }
+
+
+    /**
+     * Test ladder validation: reject missing or non-string initial context.
+     */
+    public function testLadderRejectsInvalidInitialContext(): void
+    {
+        $info = ['AuthId' => 'default-sp'];
+        $config = [
+            'entityID' => 'urn:x-simplesamlphp:example-sp',
+            'AuthnContextClassRefFallback' => [
+                'urn:step2',
+                '',
+            ],
+        ];
+        $as = new SpTester($info, $config);
+        $idpMetadata = new Configuration($this->idpConfigArray, 'test-idp');
+
+        $this->expectException(ConfigurationError::class);
+        $as->startSSO2Test($idpMetadata, []);
+    }
+
+
+    /**
+     * Test ladder validation: reject non-array fallback list.
+     */
+    public function testLadderRejectsNonArrayFallback(): void
+    {
+        $info = ['AuthId' => 'default-sp'];
+        $config = [
+            'entityID' => 'urn:x-simplesamlphp:example-sp',
+            'AuthnContextClassRef' => 'urn:step1',
+            'AuthnContextClassRefFallback' => 'invalid-string',
+        ];
+        $as = new SpTester($info, $config);
+        $idpMetadata = new Configuration($this->idpConfigArray, 'test-idp');
+
+        $this->expectException(ConfigurationError::class);
+        $as->startSSO2Test($idpMetadata, []);
     }
 
 
@@ -453,6 +837,7 @@ class SPTest extends ClearStateTestCase
         $config = [
             'entityID' => 'urn:x-simplesamlphp:example-sp',
             'proxymode.passAuthnContextClassRef' => true,
+            'AuthnContextClassRef' => 'http://example.com/originalFallbackContext',
         ];
         $as = new SpTester($info, $config);
 

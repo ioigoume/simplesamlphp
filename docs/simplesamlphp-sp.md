@@ -24,6 +24,60 @@ $config = [
 ];
 ```
 
+### Requesting REFEDS MFA (optional) with fallback
+
+Some IdPs return a `NoAuthnContext` error when a requested REFEDS MFA context
+cannot be satisfied for a user. To request a preferred context (for example,
+phishing-resistant MFA) while still allowing fallback to other contexts or to
+no explicit context, you can configure a fallback ladder.
+
+Configure `AuthnContextClassRef` as a single string, and set
+`AuthnContextClassRefFallback` as a prioritized list of fallback rungs.
+The ladder supports at most two fallback rungs (three total attempts), and the
+final rung may be the empty string (`''`) to allow a final attempt with no
+requested context.
+
+Each attempt requests exactly one context with `Comparison="exact"`. SimpleSAMLphp
+advances the ladder only after validating a signed `Responder` / `NoAuthnContext`
+response that is correlated to the current request. An explicit
+`RequestedAuthnContext` from a downstream SP disables the configured ladder for
+that proxy transaction.
+
+```php
+'default-sp' => [
+    'saml:SP',
+    // Primary request
+    'AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+    // Fallback rungs (max two)
+    'AuthnContextClassRefFallback' => [
+        'https://refeds.org/profile/mfa',
+        '',
+    ],
+],
+```
+
+These settings in `config/authsources.php` act as defaults.
+If you want different ladders depending on the upstream IdP, configure IdP-specific overrides in
+`metadata/saml20-idp-remote.php`. If either `AuthnContextClassRef` or `AuthnContextClassRefFallback` is set for the
+selected IdP, the IdP-remote policy is used and SP defaults are not.
+
+Per REFEDS guidance, requesting a context does not prove which authentication
+the upstream IdP performed. Trust and evaluate the `AuthnContextClassRef` in the
+returned assertion before granting access. In a fallback-backed proxy flow,
+SimpleSAMLphp reports this actually achieved context to the downstream SP.
+
+```php
+<?php
+
+$metadata['https://idp.example.org/metadata'] = [
+    'AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+    'AuthnContextClassRefFallback' => [
+        'https://refeds.org/profile/mfa',
+        '',
+    ],
+];
+```
+
 The entity ID must be a URI, that is unlikely to change for technical or
 political reasons. We recommend it to be a domain name that you own.
 Like above, if your organization's main domain is `example.org` and this SP is

@@ -504,57 +504,162 @@ class SP extends Auth\Source
 
         /*
          * Determine if we are currently in an AuthnContextClassRef fallback loop by checking the state.
-         * If we are in a fallback loop, we ignore the static AuthnContextClassRef from IdP or SP metadata,
-         * and strictly use the context from the state array representing the current fallback attempt.
-         * Otherwise, we evaluate the context in standard priority order: IdP metadata, state, SP metadata.
+         * If we are in a fallback loop, we strictly use the context from the state array representing
+         * the current fallback attempt and enforce exact comparison.
          */
         $isFallback = array_key_exists('saml:AuthnContextClassRefFallback', $state);
 
         $accr = null;
+        $comp = null;
+
         if ($isFallback) {
+            $ar->setRequestedAuthnContext(null);
             if (isset($state['saml:AuthnContextClassRef'])) {
                 $accr = $arrayUtils->arrayize($state['saml:AuthnContextClassRef']);
             }
+            $comp = AuthnContextComparisonTypeEnum::Exact->value;
         } else {
-            if ($idpMetadata->hasValue('AuthnContextClassRef')) {
-                $accr = $idpMetadata->getOptionalArrayizeString('AuthnContextClassRef', null);
+            $hasDownstreamRequestedAuthnContext = !empty($state['saml:RequestedAuthnContext']);
+            $policyOverridesStockResolution = false;
+            $policyFromIdp = false;
+            $initialContext = null;
+            $fallbackList = null;
+
+            if (!$hasDownstreamRequestedAuthnContext) {
+                $idpOwnsPolicy = $idpMetadata->hasValue('AuthnContextClassRef')
+                    || $idpMetadata->hasValue('AuthnContextClassRefFallback');
+
+                if ($idpOwnsPolicy) {
+                    $policyOverridesStockResolution = true;
+                    $policyFromIdp = true;
+                    $initialContext = $idpMetadata->hasValue('AuthnContextClassRef')
+                        ? $idpMetadata->getValue('AuthnContextClassRef')
+                        : null;
+                    $fallbackList = $idpMetadata->hasValue('AuthnContextClassRefFallback')
+                        ? $idpMetadata->getValue('AuthnContextClassRefFallback')
+                        : null;
+                } elseif ($this->metadata->hasValue('AuthnContextClassRefFallback')) {
+                    $policyOverridesStockResolution = true;
+                    $initialContext = $this->metadata->hasValue('AuthnContextClassRef')
+                        ? $this->metadata->getValue('AuthnContextClassRef')
+                        : null;
+                    $fallbackList = $this->metadata->getValue('AuthnContextClassRefFallback');
+                }
+            }
+
+            if ($policyOverridesStockResolution) {
+                if ($fallbackList !== null) {
+                    if (!is_array($fallbackList)) {
+                        throw new Error\ConfigurationError('AuthnContextClassRefFallback must be an array.');
+                    }
+
+                    if (count($fallbackList) > 0) {
+                        // Validate ladder shape and bounds
+                        if (!is_string($initialContext) || trim($initialContext) === '') {
+                            throw new Error\ConfigurationError(
+                                'AuthnContextClassRef must be a single non-empty string ' .
+                                'when AuthnContextClassRefFallback is configured.',
+                            );
+                        }
+
+                        if (count($fallbackList) > 2) {
+                            throw new Error\ConfigurationError(
+                                'AuthnContextClassRefFallback allows at most 2 fallback rungs ' .
+                                '(maximum 3 total attempts).',
+                            );
+                        }
+
+                        $seenContexts = [$initialContext => true];
+                        $fallbackCount = count($fallbackList);
+                        $normalizedFallback = [];
+
+                        foreach (array_values($fallbackList) as $index => $rung) {
+                            $isFinal = ($index === $fallbackCount - 1);
+
+                            if ($isFinal) {
+                                if (is_array($rung)) {
+                                    if (!empty($rung)) {
+                                        throw new Error\ConfigurationError(
+                                            'Fallback rungs must be single strings; ' .
+                                            'multi-context arrays are not allowed.',
+                                        );
+                                    }
+                                    $normalizedFallback[] = '';
+                                } elseif (is_string($rung)) {
+                                    if (trim($rung) === '') {
+                                        $normalizedFallback[] = '';
+                                    } else {
+                                        if (isset($seenContexts[$rung])) {
+                                            throw new Error\ConfigurationError(sprintf(
+                                                'Duplicate AuthnContextClassRef "%s" in fallback ladder.',
+                                                $rung,
+                                            ));
+                                        }
+                                        $seenContexts[$rung] = true;
+                                        $normalizedFallback[] = $rung;
+                                    }
+                                } else {
+                                    throw new Error\ConfigurationError(
+                                        'Invalid fallback rung type: each rung must be a string ' .
+                                        'or terminal empty array.',
+                                    );
+                                }
+                            } else {
+                                if (!is_string($rung) || trim($rung) === '') {
+                                    throw new Error\ConfigurationError(
+                                        'Non-terminal fallback rungs must be non-empty strings.',
+                                    );
+                                }
+                                if (isset($seenContexts[$rung])) {
+                                    throw new Error\ConfigurationError(sprintf(
+                                        'Duplicate AuthnContextClassRef "%s" in fallback ladder.',
+                                        $rung,
+                                    ));
+                                }
+                                $seenContexts[$rung] = true;
+                                $normalizedFallback[] = $rung;
+                            }
+                        }
+
+                        $state['saml:AuthnContextClassRefFallback'] = $normalizedFallback;
+                        $accr = [$initialContext];
+                        $comp = AuthnContextComparisonTypeEnum::Exact->value;
+                    } else {
+                        if ($policyFromIdp) {
+                            if ($initialContext !== null) {
+                                $accr = $arrayUtils->arrayize($initialContext);
+                            } else {
+                                $ar->setRequestedAuthnContext(null);
+                            }
+                        }
+                    }
+                } else {
+                    if ($initialContext !== null) {
+                        $accr = $arrayUtils->arrayize($initialContext);
+                    }
+                }
+            } elseif ($idpMetadata->getOptionalString('AuthnContextClassRef', null) !== null) {
+                $accr = $arrayUtils->arrayize($idpMetadata->getString('AuthnContextClassRef'));
             } elseif (isset($state['saml:AuthnContextClassRef'])) {
                 $accr = $arrayUtils->arrayize($state['saml:AuthnContextClassRef']);
-            } elseif ($this->metadata->hasValue('AuthnContextClassRef')) {
-                $accr = $this->metadata->getOptionalArrayizeString('AuthnContextClassRef', null);
-            }
-        }
-
-        /*
-         * Initialize the fallback array for AuthnContextClassRef if we are not already
-         * in a fallback loop.
-         * The configuration prioritizes the IdP metadata over the SP metadata.
-         * This allows the ServiceProvider controller to automatically retry authentication
-         * using sequentially different/weaker contexts if the IdP replies with a NoAuthnContext error.
-         */
-        if (!$isFallback) {
-            $fallback = $idpMetadata->getOptionalArray('AuthnContextClassRefFallback', null);
-            if ($fallback === null) {
-                $fallback = $this->metadata->getOptionalArray('AuthnContextClassRefFallback', null);
-            }
-            if ($fallback !== null) {
-                $state['saml:AuthnContextClassRefFallback'] = $fallback;
             }
         }
 
         if ($accr !== null) {
-            $comp = AuthnContextComparisonTypeEnum::Exact->value;
-            if ($idpMetadata->getOptionalString('AuthnContextComparison', null) !== null) {
-                $comp = $idpMetadata->getString('AuthnContextComparison');
-            } elseif (
-                isset($state['saml:AuthnContextComparison'])
-                && in_array(
-                    $state['saml:AuthnContextComparison'],
-                    array_column(AuthnContextComparisonTypeEnum::cases(), 'value'),
-                    true,
-                )
-            ) {
-                $comp = $state['saml:AuthnContextComparison'];
+            if ($comp === null) {
+                $comp = AuthnContextComparisonTypeEnum::Exact->value;
+                if ($idpMetadata->getOptionalString('AuthnContextComparison', null) !== null) {
+                    $comp = $idpMetadata->getString('AuthnContextComparison');
+                } elseif (
+                    isset($state['saml:AuthnContextComparison'])
+                    && in_array(
+                        $state['saml:AuthnContextComparison'],
+                        array_column(AuthnContextComparisonTypeEnum::cases(), 'value'),
+                        true,
+                    )
+                ) {
+                    $comp = $state['saml:AuthnContextComparison'];
+                }
             }
             $ar->setRequestedAuthnContext(['AuthnContextClassRef' => $accr, 'Comparison' => $comp]);
         } elseif (

@@ -1165,7 +1165,13 @@ class SAML2
         $a->setNotOnOrAfter($now + $assertionLifetime);
 
         $passAuthnContextClassRef = $config->getOptionalBoolean('proxymode.passAuthnContextClassRef', false);
-        if (isset($state['saml:AuthnContextClassRef'])) {
+        $isFallbackProxy = isset($state['saml:AuthnContextClassRefFallback'])
+            && isset($state['saml:sp:AuthnContext']);
+
+        // During proxy fallback flows, the downstream assertion must report the assurance actually achieved upstream.
+        if ($isFallbackProxy) {
+            $a->setAuthnContextClassRef($state['saml:sp:AuthnContext']);
+        } elseif (isset($state['saml:AuthnContextClassRef'])) {
             $a->setAuthnContextClassRef($state['saml:AuthnContextClassRef']);
         } elseif ($passAuthnContextClassRef && isset($state['saml:sp:AuthnContext'])) {
             // AuthnContext has been set by the upper IdP in front of the proxy, pass it back to the SP behind the proxy
@@ -1177,7 +1183,11 @@ class SAML2
         }
 
         $sessionStart = $now;
-        if (isset($state['AuthnInstant'])) {
+        if ($isFallbackProxy && isset($state['saml:AuthnInstant'])) {
+            $a->setAuthnInstant($state['saml:AuthnInstant']);
+            $sessionStart = $state['saml:AuthnInstant'];
+        } elseif (isset($state['AuthnInstant'])) {
+            // Backwards-compatible key.
             $a->setAuthnInstant($state['AuthnInstant']);
             $sessionStart = $state['AuthnInstant'];
         }

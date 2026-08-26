@@ -7,6 +7,7 @@ namespace SimpleSAML\Test\Module\saml;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use ReflectionMethod;
+use RobRichards\XMLSecLibs\XMLSecurityKey;
 use SAML2\Assertion;
 use SAML2\AuthnRequest;
 use SAML2\Response;
@@ -589,5 +590,292 @@ class MessageTest extends TestCase
         $this->expectException(SSP_Error\Exception::class);
         $this->expectExceptionMessage('Response must be signed.');
         $process();
+    }
+
+
+    /**
+     * Helper to create and sign an error response.
+     */
+    private function createSignedErrorResponse(
+        string $issuer,
+        ?string $inResponseTo,
+        string $statusCode = Constants::STATUS_RESPONDER,
+        ?string $subStatusCode = Constants::STATUS_NO_AUTHN_CONTEXT,
+        ?string $destination = null,
+        bool $sign = true,
+        bool $useValidKey = true,
+    ): Response {
+        $response = new Response();
+        $responseIssuer = new Issuer();
+        $responseIssuer->setValue($issuer);
+        $response->setIssuer($responseIssuer);
+
+        if ($inResponseTo !== null) {
+            $response->setInResponseTo($inResponseTo);
+        }
+        if ($destination !== null) {
+            $response->setDestination($destination);
+        }
+
+        $status = ['Code' => $statusCode];
+        if ($subStatusCode !== null) {
+            $status['SubCode'] = $subStatusCode;
+        }
+        $response->setStatus($status);
+
+        if ($sign) {
+            $privateKey = new XMLSecurityKey(
+                XMLSecurityKey::RSA_SHA256,
+                ['type' => 'private'],
+            );
+            $privateKey->passphrase = PEMCertificatesMock::PASSPHRASE;
+            $keyPath = $useValidKey
+                ? PEMCertificatesMock::buildKeysPath(PEMCertificatesMock::PRIVATE_KEY)
+                : PEMCertificatesMock::buildKeysPath(PEMCertificatesMock::OTHER_PRIVATE_KEY);
+            $privateKey->loadKey($keyPath, true);
+
+            $response->setSignatureKey($privateKey);
+            $cert = $useValidKey
+                ? PEMCertificatesMock::getPlainCertificateContents()
+                : PEMCertificatesMock::getPlainCertificateContents(PEMCertificatesMock::OTHER_CERTIFICATE);
+            $response->setCertificates([$cert]);
+
+            $dom = $response->toSignedXML();
+            return new Response($dom);
+        }
+
+        $dom = $response->toUnsignedXML();
+        return new Response($dom);
+    }
+
+
+    public function testValidateFallbackErrorResponseSuccess(): void
+    {
+        $idpMetadataArray = $this->acmeeMetadata;
+        $idpMetadataArray['privatekey'] = PEMCertificatesMock::buildKeysPath(PEMCertificatesMock::PRIVATE_KEY);
+        $idpMetadataArray['privatekey_pass'] = PEMCertificatesMock::PASSPHRASE;
+        $idpMetadataArray['certificate'] =
+            'vendor/simplesamlphp/xml-security/resources/certificates/' . PEMCertificatesMock::CERTIFICATE;
+
+        $idpConfig = Configuration::loadFromArray($idpMetadataArray, $idpMetadataArray['entityid']);
+        $spConfig = Configuration::loadFromArray($this->spMetadata, $this->spMetadata['entityID']);
+
+        $expectedRequestId = '_req_1';
+        $currentUrl = (new \SimpleSAML\Utils\HTTP())->getSelfURLNoQuery();
+        $response = $this->createSignedErrorResponse($this->acmeeEntityId, $expectedRequestId, destination: $currentUrl);
+
+        Message::validateFallbackErrorResponse(
+            $spConfig,
+            $idpConfig,
+            $response,
+            $expectedRequestId,
+            $this->acmeeEntityId,
+        );
+
+        $this->assertTrue(true);
+    }
+
+
+    public function testValidateFallbackErrorResponseRejectsMissingDestination(): void
+    {
+        $idpMetadataArray = $this->acmeeMetadata;
+        $idpMetadataArray['privatekey'] = PEMCertificatesMock::buildKeysPath(PEMCertificatesMock::PRIVATE_KEY);
+        $idpMetadataArray['privatekey_pass'] = PEMCertificatesMock::PASSPHRASE;
+        $idpMetadataArray['certificate'] =
+            'vendor/simplesamlphp/xml-security/resources/certificates/' . PEMCertificatesMock::CERTIFICATE;
+
+        $idpConfig = Configuration::loadFromArray($idpMetadataArray, $idpMetadataArray['entityid']);
+        $spConfig = Configuration::loadFromArray($this->spMetadata, $this->spMetadata['entityID']);
+
+        $expectedRequestId = '_req_1';
+        $response = $this->createSignedErrorResponse($this->acmeeEntityId, $expectedRequestId, destination: null);
+
+        $this->expectException(SSP_Error\Exception::class);
+        $this->expectExceptionMessage('Fallback error response must contain Destination.');
+
+        Message::validateFallbackErrorResponse(
+            $spConfig,
+            $idpConfig,
+            $response,
+            $expectedRequestId,
+            $this->acmeeEntityId,
+        );
+    }
+
+
+    public function testValidateFallbackErrorResponseRejectsSuccessResponse(): void
+    {
+        $idpMetadataArray = $this->acmeeMetadata;
+        $idpMetadataArray['certificate'] =
+            'vendor/simplesamlphp/xml-security/resources/certificates/' . PEMCertificatesMock::CERTIFICATE;
+
+        $idpConfig = Configuration::loadFromArray($idpMetadataArray, $idpMetadataArray['entityid']);
+        $spConfig = Configuration::loadFromArray($this->spMetadata, $this->spMetadata['entityID']);
+
+        $currentUrl = (new \SimpleSAML\Utils\HTTP())->getSelfURLNoQuery();
+
+        $expectedRequestId = '_req_1';
+        $response = $this->createSignedErrorResponse(
+            $this->acmeeEntityId,
+            $expectedRequestId,
+            Constants::STATUS_SUCCESS,
+            null,
+            $currentUrl,
+        );
+
+        $this->expectException(SSP_Error\Exception::class);
+        $this->expectExceptionMessage('Expected error response for fallback validation, but response status was success.');
+
+        Message::validateFallbackErrorResponse(
+            $spConfig,
+            $idpConfig,
+            $response,
+            $expectedRequestId,
+            $this->acmeeEntityId,
+        );
+    }
+
+
+    public function testValidateFallbackErrorResponseRejectsUnsigned(): void
+    {
+        $idpMetadataArray = $this->acmeeMetadata;
+        $idpMetadataArray['certificate'] =
+            'vendor/simplesamlphp/xml-security/resources/certificates/' . PEMCertificatesMock::CERTIFICATE;
+
+        $idpConfig = Configuration::loadFromArray($idpMetadataArray, $idpMetadataArray['entityid']);
+        $spConfig = Configuration::loadFromArray($this->spMetadata, $this->spMetadata['entityID']);
+
+        $currentUrl = (new \SimpleSAML\Utils\HTTP())->getSelfURLNoQuery();
+
+        $expectedRequestId = '_req_1';
+        $response = $this->createSignedErrorResponse(
+            $this->acmeeEntityId,
+            $expectedRequestId,
+            Constants::STATUS_RESPONDER,
+            Constants::STATUS_NO_AUTHN_CONTEXT,
+            $currentUrl,
+            false,
+        );
+
+        $this->expectException(SSP_Error\Exception::class);
+        $this->expectExceptionMessage('Fallback error response must be signed.');
+
+        Message::validateFallbackErrorResponse(
+            $spConfig,
+            $idpConfig,
+            $response,
+            $expectedRequestId,
+            $this->acmeeEntityId,
+        );
+    }
+
+
+    public function testValidateFallbackErrorResponseRejectsWrongDestination(): void
+    {
+        $idpMetadataArray = $this->acmeeMetadata;
+        $idpMetadataArray['certificate'] =
+            'vendor/simplesamlphp/xml-security/resources/certificates/' . PEMCertificatesMock::CERTIFICATE;
+
+        $idpConfig = Configuration::loadFromArray($idpMetadataArray, $idpMetadataArray['entityid']);
+        $spConfig = Configuration::loadFromArray($this->spMetadata, $this->spMetadata['entityID']);
+
+        $expectedRequestId = '_req_1';
+        $response = $this->createSignedErrorResponse(
+            $this->acmeeEntityId,
+            $expectedRequestId,
+            Constants::STATUS_RESPONDER,
+            Constants::STATUS_NO_AUTHN_CONTEXT,
+            'https://wrong.destination.example.org/acs',
+        );
+
+        $this->expectException(\Exception::class);
+        $this->expectExceptionMessage('Destination in response doesn\'t match the current URL.');
+
+        Message::validateFallbackErrorResponse(
+            $spConfig,
+            $idpConfig,
+            $response,
+            $expectedRequestId,
+            $this->acmeeEntityId,
+        );
+    }
+
+
+    public function testValidateFallbackErrorResponseRejectsIssuerMismatch(): void
+    {
+        $idpMetadataArray = $this->acmeeMetadata;
+        $idpMetadataArray['certificate'] =
+            'vendor/simplesamlphp/xml-security/resources/certificates/' . PEMCertificatesMock::CERTIFICATE;
+
+        $idpConfig = Configuration::loadFromArray($idpMetadataArray, $idpMetadataArray['entityid']);
+        $spConfig = Configuration::loadFromArray($this->spMetadata, $this->spMetadata['entityID']);
+
+        $currentUrl = (new \SimpleSAML\Utils\HTTP())->getSelfURLNoQuery();
+
+        $expectedRequestId = '_req_1';
+        $response = $this->createSignedErrorResponse($this->acmeeEntityId, $expectedRequestId, destination: $currentUrl);
+
+        $this->expectException(SSP_Error\Exception::class);
+        $this->expectExceptionMessage('Issuer mismatch.');
+
+        Message::validateFallbackErrorResponse(
+            $spConfig,
+            $idpConfig,
+            $response,
+            $expectedRequestId,
+            'https://expected.other-idp.example.org',
+        );
+    }
+
+
+    public function testValidateFallbackErrorResponseRejectsInResponseToMismatch(): void
+    {
+        $idpMetadataArray = $this->acmeeMetadata;
+        $idpMetadataArray['certificate'] =
+            'vendor/simplesamlphp/xml-security/resources/certificates/' . PEMCertificatesMock::CERTIFICATE;
+
+        $idpConfig = Configuration::loadFromArray($idpMetadataArray, $idpMetadataArray['entityid']);
+        $spConfig = Configuration::loadFromArray($this->spMetadata, $this->spMetadata['entityID']);
+
+        $currentUrl = (new \SimpleSAML\Utils\HTTP())->getSelfURLNoQuery();
+
+        $response = $this->createSignedErrorResponse($this->acmeeEntityId, '_actual_request_id', destination: $currentUrl);
+
+        $this->expectException(SSP_Error\Exception::class);
+        $this->expectExceptionMessage('Response InResponseTo does not match expected request ID.');
+
+        Message::validateFallbackErrorResponse(
+            $spConfig,
+            $idpConfig,
+            $response,
+            '_different_expected_request_id',
+            $this->acmeeEntityId,
+        );
+    }
+
+
+    public function testValidateFallbackErrorResponseRejectsMissingInResponseTo(): void
+    {
+        $idpMetadataArray = $this->acmeeMetadata;
+        $idpMetadataArray['certificate'] =
+            'vendor/simplesamlphp/xml-security/resources/certificates/' . PEMCertificatesMock::CERTIFICATE;
+
+        $idpConfig = Configuration::loadFromArray($idpMetadataArray, $idpMetadataArray['entityid']);
+        $spConfig = Configuration::loadFromArray($this->spMetadata, $this->spMetadata['entityID']);
+
+        $currentUrl = (new \SimpleSAML\Utils\HTTP())->getSelfURLNoQuery();
+
+        $response = $this->createSignedErrorResponse($this->acmeeEntityId, null, destination: $currentUrl);
+
+        $this->expectException(SSP_Error\Exception::class);
+        $this->expectExceptionMessage('Fallback error response must contain InResponseTo.');
+
+        Message::validateFallbackErrorResponse(
+            $spConfig,
+            $idpConfig,
+            $response,
+            '_expected_request_id',
+            $this->acmeeEntityId,
+        );
     }
 }

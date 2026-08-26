@@ -8,15 +8,19 @@ use Exception;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use RobRichards\XMLSecLibs\XMLSecurityKey;
+use SAML2\XML\saml\Issuer;
 use SimpleSAML\Auth;
 use SimpleSAML\Configuration;
 use SimpleSAML\Error;
 use SimpleSAML\HTTP\RunnableResponse;
 use SimpleSAML\Module\saml\Auth\Source;
 use SimpleSAML\Module\saml\Controller;
+use SimpleSAML\SAML2\Constants;
 use SimpleSAML\Session;
 use SimpleSAML\Utils;
 use SimpleSAML\XHTML\Template;
+use SimpleSAML\XMLSecurity\TestUtils\PEMCertificatesMock;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
 
@@ -929,16 +933,97 @@ XML;
 
 
     /**
-     * Test that receiving a NoAuthnContext error with fallback configured
-     * modifies state and returns a RunnableResponse.
-     *
-     * @return void
+     * Helper to generate XML metadata for an IdP with an X.509 signing certificate.
      */
-    public function testACSFallbackOnNoAuthnContext(): void
+    private function generateIdpMetadataWithCert(string $entityId): string
     {
-        $issuer = 'https://idp.example.org/metadata';
+        $certData = PEMCertificatesMock::getPlainCertificateContents();
+        $certDataClean = str_replace(
+            ["\r", "\n", "-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----"],
+            '',
+            $certData,
+        );
 
-        $xml = \SimpleSAML\Test\Metadata\MetaDataStorageSourceTest::generateIdpMetadataXml($issuer);
+        return <<<XML
+<EntityDescriptor ID="_12345678-90ab-cdef-1234-567890abcdef" entityID="{$entityId}" xmlns="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+<IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
+<KeyDescriptor use="signing">
+  <ds:KeyInfo>
+    <ds:X509Data>
+      <ds:X509Certificate>{$certDataClean}</ds:X509Certificate>
+    </ds:X509Data>
+  </ds:KeyInfo>
+</KeyDescriptor>
+<SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="https://saml.idp/sso/"/>
+<SingleLogoutService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="https://saml.idp/logout/"/>
+</IDPSSODescriptor>
+</EntityDescriptor>
+XML;
+    }
+
+
+    /**
+     * Helper to generate a signed or unsigned error response.
+     */
+    private function generateSignedErrorResponse(
+        string $issuer,
+        ?string $stateId,
+        string $statusCode = Constants::STATUS_RESPONDER,
+        ?string $subStatusCode = Constants::STATUS_NO_AUTHN_CONTEXT,
+        ?string $destination = null,
+        bool $sign = true,
+        bool $useValidKey = true,
+    ): string {
+        $response = new \SAML2\Response();
+        $issuerObj = new Issuer();
+        $issuerObj->setValue($issuer);
+        $response->setIssuer($issuerObj);
+        if ($stateId !== null) {
+            $response->setInResponseTo($stateId);
+        }
+
+        $destination ??= (new Utils\HTTP())->getSelfURLNoQuery();
+        $response->setDestination($destination);
+
+        $status = ['Code' => $statusCode];
+        if ($subStatusCode !== null) {
+            $status['SubCode'] = $subStatusCode;
+        }
+        $status['Message'] = 'Error message';
+        $response->setStatus($status);
+
+        if ($sign) {
+            $privateKey = new XMLSecurityKey(
+                XMLSecurityKey::RSA_SHA256,
+                ['type' => 'private'],
+            );
+            $privateKey->passphrase = PEMCertificatesMock::PASSPHRASE;
+            $keyPath = $useValidKey
+                ? PEMCertificatesMock::buildKeysPath(PEMCertificatesMock::PRIVATE_KEY)
+                : PEMCertificatesMock::buildKeysPath(PEMCertificatesMock::OTHER_PRIVATE_KEY);
+            $privateKey->loadKey($keyPath, true);
+
+            $response->setSignatureKey($privateKey);
+            $cert = $useValidKey
+                ? PEMCertificatesMock::getPlainCertificateContents()
+                : PEMCertificatesMock::getPlainCertificateContents(PEMCertificatesMock::OTHER_CERTIFICATE);
+            $response->setCertificates([$cert]);
+
+            $dom = $response->toSignedXML();
+            return $dom->ownerDocument->saveXML($dom);
+        }
+
+        $dom = $response->toUnsignedXML();
+        return $dom->ownerDocument->saveXML($dom);
+    }
+
+
+    /**
+     * Helper to set up the SP tester environment for fallback tests.
+     */
+    private function setupFallbackEnvironment(string $issuer): Configuration
+    {
+        $xml = $this->generateIdpMetadataWithCert($issuer);
 
         $c = [
             'metadata.sources' => [
@@ -966,38 +1051,31 @@ XML;
         );
         Configuration::setPreLoadedConfig($authsources, 'authsources.php');
 
+        return $config;
+    }
+
+
+    /**
+     * Test that receiving a valid signed NoAuthnContext error with fallback configured
+     * consumes old state, modifies state, and returns a RunnableResponse.
+     */
+    public function testACSFallbackOnNoAuthnContext(): void
+    {
+        $issuer = 'https://idp.example.org/metadata';
+        $config = $this->setupFallbackEnvironment($issuer);
+
         $state = [
             'saml:sp:AuthId' => 'phpunit',
             'ExpectedIssuer' => $issuer,
             'saml:AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
             'saml:AuthnContextClassRefFallback' => [
-                [
-                    'https://refeds.org/profile/mfa',
-                    'https://refeds.org/profile/sfa',
-                ],
                 'https://refeds.org/profile/mfa',
-                [],
+                '',
             ],
         ];
 
         $stateId = Auth\State::saveState($state, 'saml:sp:sso', true);
-
-        $xml = <<<XML
-<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
-               xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
-               ID="_resp_1"
-               Version="2.0"
-               IssueInstant="2026-05-22T12:34:56Z"
-               InResponseTo="{$stateId}">
-  <saml:Issuer>{$issuer}</saml:Issuer>
-  <samlp:Status>
-    <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Responder">
-        <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:NoAuthnContext"/>
-    </samlp:StatusCode>
-    <samlp:StatusMessage>Could not satisfy requested AuthnContext</samlp:StatusMessage>
-  </samlp:Status>
-</samlp:Response>
-XML;
+        $xml = $this->generateSignedErrorResponse($issuer, $stateId);
 
         $_SERVER['REQUEST_METHOD'] = 'POST';
         $_SERVER['QUERY_STRING'] = '';
@@ -1019,14 +1097,21 @@ XML;
 
         $updatedState = $args[0];
         $this->assertEquals(
-            ['https://refeds.org/profile/mfa', 'https://refeds.org/profile/sfa'],
+            'https://refeds.org/profile/mfa',
             $updatedState['saml:AuthnContextClassRef'],
         );
         $this->assertEquals(
-            ['https://refeds.org/profile/mfa', []],
+            [''],
             $updatedState['saml:AuthnContextClassRefFallback'],
         );
-        $this->assertArrayNotHasKey(\SimpleSAML\Auth\State::ID, $updatedState, 'The state ID must be unset to force a new Request ID for the fallback request.');
+        $this->assertArrayNotHasKey(
+            \SimpleSAML\Auth\State::ID,
+            $updatedState,
+            'The state ID must be unset to force a new Request ID for the fallback request.',
+        );
+
+        // Verify the consumed old state was deleted from session storage
+        $this->assertNull(Auth\State::loadState($stateId, 'saml:sp:sso', true));
 
         // Execute the RunnableResponse to trigger the fallback SAML AuthnRequest
         try {
@@ -1042,9 +1127,328 @@ XML;
             $this->assertIsArray($requestedContext);
             $this->assertArrayHasKey('AuthnContextClassRef', $requestedContext);
             $this->assertEquals(
-                ['https://refeds.org/profile/mfa', 'https://refeds.org/profile/sfa'],
+                ['https://refeds.org/profile/mfa'],
                 $requestedContext['AuthnContextClassRef'],
             );
         }
+    }
+
+
+    /**
+     * Test that fallback to terminal no-context unsets AuthnContextClassRef
+     * and produces an AuthnRequest with no RequestedAuthnContext.
+     */
+    public function testACSFallbackOnTerminalNoContext(): void
+    {
+        $issuer = 'https://idp.example.org/metadata';
+        $config = $this->setupFallbackEnvironment($issuer);
+
+        $state = [
+            'saml:sp:AuthId' => 'phpunit',
+            'ExpectedIssuer' => $issuer,
+            'saml:AuthnContextClassRef' => 'https://refeds.org/profile/mfa',
+            'saml:AuthnContextClassRefFallback' => [
+                '',
+            ],
+        ];
+
+        $stateId = Auth\State::saveState($state, 'saml:sp:sso', true);
+        $xml = $this->generateSignedErrorResponse($issuer, $stateId);
+
+        $_SERVER['REQUEST_METHOD'] = 'POST';
+        $_SERVER['QUERY_STRING'] = '';
+        $_POST = [
+            'SAMLResponse' => base64_encode($xml),
+        ];
+
+        $controller = new Controller\ServiceProvider($config, $this->session);
+        $result = $controller->assertionConsumerService('phpunit');
+
+        $this->assertInstanceOf(\SimpleSAML\HTTP\RunnableResponse::class, $result);
+
+        $args = $result->getArguments();
+        $updatedState = $args[0];
+
+        $this->assertArrayNotHasKey('saml:AuthnContextClassRef', $updatedState);
+        $this->assertEquals([], $updatedState['saml:AuthnContextClassRefFallback']);
+        $this->assertArrayNotHasKey(\SimpleSAML\Auth\State::ID, $updatedState);
+        $this->assertNull(Auth\State::loadState($stateId, 'saml:sp:sso', true));
+
+        // Execute the RunnableResponse to trigger the fallback SAML AuthnRequest
+        try {
+            $result->sendContent();
+            $this->fail('Expected ExitTestException to be thrown by SpTester');
+        } catch (\SimpleSAML\Test\Utils\ExitTestException $e) {
+            $r = $e->getTestResult();
+            /** @var \SAML2\AuthnRequest $ar */
+            $ar = $r['ar'];
+
+            // Verify no RequestedAuthnContext is set for terminal fallback
+            $this->assertNull($ar->getRequestedAuthnContext());
+        }
+    }
+
+
+    /**
+     * Test that unsigned error response is rejected without retrying or deleting state.
+     */
+    public function testACSFallbackRejectsUnsignedErrorResponse(): void
+    {
+        $issuer = 'https://idp.example.org/metadata';
+        $config = $this->setupFallbackEnvironment($issuer);
+
+        $state = [
+            'saml:sp:AuthId' => 'phpunit',
+            'ExpectedIssuer' => $issuer,
+            'saml:AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+            'saml:AuthnContextClassRefFallback' => ['https://refeds.org/profile/mfa', ''],
+        ];
+
+        $stateId = Auth\State::saveState($state, 'saml:sp:sso', true);
+        $xml = $this->generateSignedErrorResponse($issuer, $stateId, sign: false);
+
+        $_SERVER['REQUEST_METHOD'] = 'POST';
+        $_SERVER['QUERY_STRING'] = '';
+        $_POST = [
+            'SAMLResponse' => base64_encode($xml),
+        ];
+
+        $controller = new Controller\ServiceProvider($config, $this->session);
+
+        try {
+            $controller->assertionConsumerService('phpunit');
+            $this->fail('Expected exception for unsigned error response');
+        } catch (\SimpleSAML\Error\Exception $e) {
+            $this->assertStringContainsString('Fallback error response must be signed', $e->getMessage());
+        }
+
+        // Verify old state was NOT consumed/deleted
+        $this->assertNotNull(Auth\State::loadState($stateId, 'saml:sp:sso', true));
+    }
+
+
+    /**
+     * Test that error response with invalid signature is rejected without retrying or deleting state.
+     */
+    public function testACSFallbackRejectsBadSignature(): void
+    {
+        $issuer = 'https://idp.example.org/metadata';
+        $config = $this->setupFallbackEnvironment($issuer);
+
+        $state = [
+            'saml:sp:AuthId' => 'phpunit',
+            'ExpectedIssuer' => $issuer,
+            'saml:AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+            'saml:AuthnContextClassRefFallback' => ['https://refeds.org/profile/mfa', ''],
+        ];
+
+        $stateId = Auth\State::saveState($state, 'saml:sp:sso', true);
+        $xml = $this->generateSignedErrorResponse($issuer, $stateId, useValidKey: false);
+
+        $_SERVER['REQUEST_METHOD'] = 'POST';
+        $_SERVER['QUERY_STRING'] = '';
+        $_POST = [
+            'SAMLResponse' => base64_encode($xml),
+        ];
+
+        $controller = new Controller\ServiceProvider($config, $this->session);
+
+        try {
+            $controller->assertionConsumerService('phpunit');
+            $this->fail('Expected exception for bad signature');
+        } catch (\Exception $e) {
+            $this->assertTrue(true);
+        }
+
+        // Verify old state was NOT consumed/deleted
+        $this->assertNotNull(Auth\State::loadState($stateId, 'saml:sp:sso', true));
+    }
+
+
+    /**
+     * Test that error response with destination mismatch is rejected without retrying or deleting state.
+     */
+    public function testACSFallbackRejectsDestinationMismatch(): void
+    {
+        $issuer = 'https://idp.example.org/metadata';
+        $config = $this->setupFallbackEnvironment($issuer);
+
+        $state = [
+            'saml:sp:AuthId' => 'phpunit',
+            'ExpectedIssuer' => $issuer,
+            'saml:AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+            'saml:AuthnContextClassRefFallback' => ['https://refeds.org/profile/mfa', ''],
+        ];
+
+        $stateId = Auth\State::saveState($state, 'saml:sp:sso', true);
+        $xml = $this->generateSignedErrorResponse(
+            $issuer,
+            $stateId,
+            destination: 'https://wrong-acs.example.org/saml2/acs',
+        );
+
+        $_SERVER['REQUEST_METHOD'] = 'POST';
+        $_SERVER['QUERY_STRING'] = '';
+        $_POST = [
+            'SAMLResponse' => base64_encode($xml),
+        ];
+
+        $controller = new Controller\ServiceProvider($config, $this->session);
+
+        $this->expectException(\Exception::class);
+        $this->expectExceptionMessage('Destination in response doesn\'t match the current URL');
+
+        try {
+            $controller->assertionConsumerService('phpunit');
+        } finally {
+            // Verify old state was NOT consumed/deleted
+            $this->assertNotNull(Auth\State::loadState($stateId, 'saml:sp:sso', true));
+        }
+    }
+
+
+    /**
+     * Test that error response with issuer mismatch is rejected without retrying.
+     */
+    public function testACSFallbackRejectsIssuerMismatch(): void
+    {
+        $issuer = 'https://idp.example.org/metadata';
+        $config = $this->setupFallbackEnvironment($issuer);
+
+        $state = [
+            'saml:sp:AuthId' => 'phpunit',
+            'ExpectedIssuer' => 'https://expected-idp.example.org/metadata',
+            'saml:AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+            'saml:AuthnContextClassRefFallback' => ['https://refeds.org/profile/mfa', ''],
+        ];
+
+        $stateId = Auth\State::saveState($state, 'saml:sp:sso', true);
+        $xml = $this->generateSignedErrorResponse($issuer, $stateId);
+
+        $_SERVER['REQUEST_METHOD'] = 'POST';
+        $_SERVER['QUERY_STRING'] = '';
+        $_POST = [
+            'SAMLResponse' => base64_encode($xml),
+        ];
+
+        $controller = new Controller\ServiceProvider($config, $this->session);
+
+        $this->expectException(Error\Exception::class);
+        $this->expectExceptionMessage('Issuer mismatch');
+
+        try {
+            $controller->assertionConsumerService('phpunit');
+        } finally {
+            $this->assertNotNull(Auth\State::loadState($stateId, 'saml:sp:sso', true));
+        }
+    }
+
+
+    /**
+     * Test that error response with InResponseTo mismatch is rejected without retrying.
+     */
+    public function testACSFallbackRejectsInResponseToMismatch(): void
+    {
+        $issuer = 'https://idp.example.org/metadata';
+        $config = $this->setupFallbackEnvironment($issuer);
+
+        $state = [
+            'saml:sp:AuthId' => 'phpunit',
+            'ExpectedIssuer' => $issuer,
+            'saml:AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+            'saml:AuthnContextClassRefFallback' => ['https://refeds.org/profile/mfa', ''],
+        ];
+
+        $stateId = Auth\State::saveState($state, 'saml:sp:sso', true);
+        $xml = $this->generateSignedErrorResponse($issuer, '_mismatched_request_id');
+
+        $_SERVER['REQUEST_METHOD'] = 'POST';
+        $_SERVER['QUERY_STRING'] = '';
+        $_POST = [
+            'SAMLResponse' => base64_encode($xml),
+        ];
+
+        $controller = new Controller\ServiceProvider($config, $this->session);
+
+        $this->expectException(\Exception::class);
+
+        try {
+            $controller->assertionConsumerService('phpunit');
+        } finally {
+            $this->assertNotNull(Auth\State::loadState($stateId, 'saml:sp:sso', true));
+        }
+    }
+
+
+    /**
+     * Test that non-NoAuthnContext error status (e.g. Requester) is not retried.
+     */
+    public function testACSFallbackRejectsNonNoAuthnContextError(): void
+    {
+        $issuer = 'https://idp.example.org/metadata';
+        $config = $this->setupFallbackEnvironment($issuer);
+
+        $state = [
+            'saml:sp:AuthId' => 'phpunit',
+            'ExpectedIssuer' => $issuer,
+            'saml:AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+            'saml:AuthnContextClassRefFallback' => ['https://refeds.org/profile/mfa', ''],
+        ];
+
+        $stateId = Auth\State::saveState($state, 'saml:sp:sso', true);
+        $xml = $this->generateSignedErrorResponse(
+            $issuer,
+            $stateId,
+            statusCode: Constants::STATUS_REQUESTER,
+            subStatusCode: null,
+            sign: false,
+        );
+
+        $_SERVER['REQUEST_METHOD'] = 'POST';
+        $_SERVER['QUERY_STRING'] = '';
+        $_POST = [
+            'SAMLResponse' => base64_encode($xml),
+        ];
+
+        $controller = new Controller\ServiceProvider($config, $this->session);
+
+        try {
+            $controller->assertionConsumerService('phpunit');
+            $this->fail('Expected the SAML error response to fail');
+        } catch (Error\Exception $e) {
+            $this->assertStringNotContainsString('Fallback error response', $e->getMessage());
+        }
+    }
+
+
+    /**
+     * Test that an empty fallback list in state does not trigger retry.
+     */
+    public function testACSFallbackEmptyFallbackListDoesNotRetry(): void
+    {
+        $issuer = 'https://idp.example.org/metadata';
+        $config = $this->setupFallbackEnvironment($issuer);
+
+        $state = [
+            'saml:sp:AuthId' => 'phpunit',
+            'ExpectedIssuer' => $issuer,
+            'saml:AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+            'saml:AuthnContextClassRefFallback' => [],
+        ];
+
+        $stateId = Auth\State::saveState($state, 'saml:sp:sso', true);
+        $xml = $this->generateSignedErrorResponse($issuer, $stateId);
+
+        $_SERVER['REQUEST_METHOD'] = 'POST';
+        $_SERVER['QUERY_STRING'] = '';
+        $_POST = [
+            'SAMLResponse' => base64_encode($xml),
+        ];
+
+        $controller = new Controller\ServiceProvider($config, $this->session);
+
+        $this->expectException(Error\Exception::class);
+
+        $controller->assertionConsumerService('phpunit');
     }
 }

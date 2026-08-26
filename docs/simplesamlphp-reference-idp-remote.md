@@ -21,23 +21,46 @@ $metadata['entity-id-2'] = [
 `AuthnContextClassRef`
 :   The AuthnContextClassRef that will be sent in the login request.
 
-:   Note that this option also exists in the SP configuration. This
-    entry in the IdP-remote metadata overrides the option in the
-    [SP configuration](./saml:sp).
+:   When `AuthnContextClassRefFallback` is configured, `AuthnContextClassRef` must be a single non-empty string.
+
+:   Note that these options also exist in the SP configuration.
+    If either `AuthnContextClassRef` or `AuthnContextClassRefFallback` is set here for the selected IdP,
+    the pair is taken from the IdP-remote metadata and SP defaults are not used.
 
 `AuthnContextClassRefFallback`
 :   A prioritized array of fallback authentication contexts to use if the IdP
     responds with a `NoAuthnContext` error. This is particularly useful in a
     proxy scenario (e.g., requesting REFEDS MFA phishing-resistant, then
     falling back to standard MFA if the user doesn't have a hardware key).
-    Each element in the array can be a single string (representing one context class)
-    or an array of strings (if requesting multiple classes simultaneously).
-    An empty string or an empty array as the last element allows a final fallback
+    Each element in the array must be a single string (representing one context
+    class), and the list may contain at most two fallback rungs (three total
+    attempts including the initial `AuthnContextClassRef`).
+    The final element may be the empty string (`''`) to allow a final fallback
     to standard login without an explicit context.
 
-:   Note that this option also exists in the SP configuration. This
-    entry in the IdP-remote metadata overrides the option in the
-    [SP configuration](./saml:sp).
+:   The empty string is only allowed as the final element and duplicate values are not allowed.
+    Setting this option to an empty array (`[]`) disables fallback retries and results in a single attempt
+    (it does not inherit SP retry policy).
+
+:   Each attempt requests exactly one context with `Comparison="exact"`. A retry occurs only after a signed,
+    correlated `Responder` / `NoAuthnContext` response has been validated. An explicit `RequestedAuthnContext`
+    from a downstream SP disables the configured ladder for that transaction.
+
+:   Per REFEDS guidance, the requested context is not proof of the authentication performed. Trust and evaluate
+    the `AuthnContextClassRef` actually returned by this IdP. A fallback-backed proxy assertion reports that
+    achieved context to the downstream SP.
+
+    Example:
+
+```php
+'AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+'AuthnContextClassRefFallback' => [
+    'https://refeds.org/profile/mfa',
+    '',
+],
+```
+
+:   See `AuthnContextClassRef` above for precedence rules between IdP-remote and SP defaults.
 
 `AuthnContextComparison`
 
