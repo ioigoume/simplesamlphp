@@ -267,20 +267,27 @@ class IdP
      */
     public static function postAuthProc(array $state): void
     {
-        Assert::isCallable($state['Responder']);
+        try {
+            Assert::isCallable($state['Responder']);
 
-        if (isset($state['core:SP'])) {
-            $session = Session::getSessionFromRequest();
-            $session->setData(
-                'core:idp-ssotime',
-                $state['core:IdP'] . ';' . $state['core:SP'],
-                time(),
-                Session::DATA_TIMEOUT_SESSION_END,
-            );
+            if (isset($state['core:SP'])) {
+                $session = Session::getSessionFromRequest();
+                $session->setData(
+                    'core:idp-ssotime',
+                    $state['core:IdP'] . ';' . $state['core:SP'],
+                    time(),
+                    Session::DATA_TIMEOUT_SESSION_END,
+                );
+            }
+
+            call_user_func($state['Responder'], $state);
+            Assert::true(false);
+        } catch (Error\Exception $e) {
+            Auth\State::throwException($state, $e);
+        } catch (\Exception $e) {
+            $e = new Error\UnserializableException($e);
+            Auth\State::throwException($state, $e);
         }
-
-        call_user_func($state['Responder'], $state);
-        Assert::true(false);
     }
 
 
@@ -323,9 +330,16 @@ class IdP
         $state['Destination'] = $spMetadata;
         $state['Source'] = $idpMetadata;
 
-        $pc->processState($state);
+        try {
+            $pc->processState($state);
 
-        self::postAuthProc($state);
+            self::postAuthProc($state);
+        } catch (Error\Exception $e) {
+            Auth\State::throwException($state, $e);
+        } catch (\Exception $e) {
+            $e = new Error\UnserializableException($e);
+            Auth\State::throwException($state, $e);
+        }
     }
 
 
