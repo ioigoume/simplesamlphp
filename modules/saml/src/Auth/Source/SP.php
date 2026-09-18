@@ -478,13 +478,27 @@ class SP extends Auth\Source
 
 
     /**
-     * Send a SAML2 SSO request to an IdP
+     * Send a SAML 2.0 AuthnRequest to an Identity Provider (IdP).
      *
-     * @param \SimpleSAML\Configuration $idpMetadata  The metadata of the IdP.
-     * @param array $state  The state array for the current authentication.
+     * Constructs, configures, and transmits a <samlp:AuthnRequest> message according to
+     * SAML 2.0 Core §3.4.1. This coordinates:
+     * - ProxyCount boundary enforcement (Core §3.4.1.5)
+     * - ACS URL and RelayState initialization
+     * - RequestedAuthnContext and sequential fallback negotiation (Core §3.3.2.2.1)
+     * - Subject NameID specification (Core §3.4.1 / §2.2)
+     * - Scoping, IDPList, and RequesterID proxy propagation (Core §3.4.1.5)
+     * - Endpoint resolution and protocol binding dispatch (Profiles §4.1.3.1)
+     *
+     * @param \SimpleSAML\Configuration $idpMetadata The metadata of the target IdP.
+     * @param array $state The state array for the current authentication.
+     *
+     * @throws \SimpleSAML\Module\saml\Error\ProxyCountExceeded If the proxy limit has been exceeded.
+     * @throws \SimpleSAML\Error\ConfigurationError If RequestedAuthnContext fallback configuration is invalid.
+     * @throws \SimpleSAML\Error\Exception If state parameters (such as NameID) are invalid.
      */
     private function startSSO2(Configuration $idpMetadata, array $state): void
     {
+        // 1. Guard against exceeded proxy count (SAML 2.0 Core §3.4.1.5 Scoping / ProxyCount)
         if (isset($state['saml:ProxyCount']) && $state['saml:ProxyCount'] < 0) {
             Auth\State::throwException(
                 $state,
@@ -492,201 +506,18 @@ class SP extends Auth\Source
             );
         }
 
+        // 2. Initialize the SAML 2.0 AuthnRequest with ACS URL and RelayState (Core §3.4.1)
         $ar = Module\saml\Message::buildAuthnRequest($this->metadata, $idpMetadata);
-
         $ar->setAssertionConsumerServiceURL(Module::getModuleURL('saml/sp/saml2-acs.php/' . $this->authId));
 
         if (isset($state['\SimpleSAML\Auth\Source.ReturnURL'])) {
             $ar->setRelayState($state['\SimpleSAML\Auth\Source.ReturnURL']);
         }
 
-        $arrayUtils = new Utils\Arrays();
+        // 3. Configure SAML 2.0 RequestedAuthnContext and sequential fallback ladder (Core §3.3.2.2.1)
+        $this->configureRequestedAuthnContext($ar, $idpMetadata, $state);
 
-        /*
-         * Determine if we are currently in an AuthnContextClassRef fallback loop by checking the state.
-         * If we are in a fallback loop, we strictly use the context from the state array representing
-         * the current fallback attempt and enforce exact comparison.
-         */
-        $isFallback = array_key_exists('saml:AuthnContextClassRefFallback', $state);
-
-        $accr = null;
-        $comp = null;
-
-        if ($isFallback) {
-            $ar->setRequestedAuthnContext(null);
-            if (isset($state['saml:AuthnContextClassRef'])) {
-                $accr = $arrayUtils->arrayize($state['saml:AuthnContextClassRef']);
-            }
-            $comp = AuthnContextComparisonTypeEnum::Exact->value;
-        } else {
-            $hasDownstreamRequestedAuthnContext = !empty($state['saml:RequestedAuthnContext']);
-            $policyOverridesStockResolution = false;
-            $policyFromIdp = false;
-            $initialContext = null;
-            $fallbackList = null;
-
-            if (!$hasDownstreamRequestedAuthnContext) {
-                $idpOwnsPolicy = $idpMetadata->hasValue('AuthnContextClassRef')
-                    || $idpMetadata->hasValue('AuthnContextClassRefFallback');
-
-                if ($idpOwnsPolicy) {
-                    $policyOverridesStockResolution = true;
-                    $policyFromIdp = true;
-                    $initialContext = $idpMetadata->hasValue('AuthnContextClassRef')
-                        ? $idpMetadata->getValue('AuthnContextClassRef')
-                        : null;
-                    $fallbackList = $idpMetadata->hasValue('AuthnContextClassRefFallback')
-                        ? $idpMetadata->getValue('AuthnContextClassRefFallback')
-                        : null;
-                } elseif ($this->metadata->hasValue('AuthnContextClassRefFallback')) {
-                    $policyOverridesStockResolution = true;
-                    $initialContext = $this->metadata->hasValue('AuthnContextClassRef')
-                        ? $this->metadata->getValue('AuthnContextClassRef')
-                        : null;
-                    $fallbackList = $this->metadata->getValue('AuthnContextClassRefFallback');
-                }
-            }
-
-            if ($policyOverridesStockResolution) {
-                if ($fallbackList !== null) {
-                    if (!is_array($fallbackList)) {
-                        throw new Error\ConfigurationError('AuthnContextClassRefFallback must be an array.');
-                    }
-
-                    if (count($fallbackList) > 0) {
-                        // Validate ladder shape and bounds
-                        if (!is_string($initialContext) || trim($initialContext) === '') {
-                            throw new Error\ConfigurationError(
-                                'AuthnContextClassRef must be a single non-empty string ' .
-                                'when AuthnContextClassRefFallback is configured.',
-                            );
-                        }
-
-                        if (count($fallbackList) > 2) {
-                            throw new Error\ConfigurationError(
-                                'AuthnContextClassRefFallback allows at most 2 fallback rungs ' .
-                                '(maximum 3 total attempts).',
-                            );
-                        }
-
-                        $seenContexts = [$initialContext => true];
-                        $fallbackCount = count($fallbackList);
-                        $normalizedFallback = [];
-
-                        foreach (array_values($fallbackList) as $index => $rung) {
-                            $isFinal = ($index === $fallbackCount - 1);
-
-                            if ($isFinal) {
-                                if (is_array($rung)) {
-                                    if (!empty($rung)) {
-                                        throw new Error\ConfigurationError(
-                                            'Fallback rungs must be single strings; ' .
-                                            'multi-context arrays are not allowed.',
-                                        );
-                                    }
-                                    $normalizedFallback[] = '';
-                                } elseif (is_string($rung)) {
-                                    if (trim($rung) === '') {
-                                        $normalizedFallback[] = '';
-                                    } else {
-                                        if (isset($seenContexts[$rung])) {
-                                            throw new Error\ConfigurationError(sprintf(
-                                                'Duplicate AuthnContextClassRef "%s" in fallback ladder.',
-                                                $rung,
-                                            ));
-                                        }
-                                        $seenContexts[$rung] = true;
-                                        $normalizedFallback[] = $rung;
-                                    }
-                                } else {
-                                    throw new Error\ConfigurationError(
-                                        'Invalid fallback rung type: each rung must be a string ' .
-                                        'or terminal empty array.',
-                                    );
-                                }
-                            } else {
-                                if (!is_string($rung) || trim($rung) === '') {
-                                    throw new Error\ConfigurationError(
-                                        'Non-terminal fallback rungs must be non-empty strings.',
-                                    );
-                                }
-                                if (isset($seenContexts[$rung])) {
-                                    throw new Error\ConfigurationError(sprintf(
-                                        'Duplicate AuthnContextClassRef "%s" in fallback ladder.',
-                                        $rung,
-                                    ));
-                                }
-                                $seenContexts[$rung] = true;
-                                $normalizedFallback[] = $rung;
-                            }
-                        }
-
-                        $state['saml:AuthnContextClassRefFallback'] = $normalizedFallback;
-                        $accr = [$initialContext];
-                        $comp = AuthnContextComparisonTypeEnum::Exact->value;
-                    } else {
-                        if ($policyFromIdp) {
-                            if ($initialContext !== null) {
-                                $accr = $arrayUtils->arrayize($initialContext);
-                            } else {
-                                $ar->setRequestedAuthnContext(null);
-                            }
-                        }
-                    }
-                } else {
-                    if ($initialContext !== null) {
-                        $accr = $arrayUtils->arrayize($initialContext);
-                    }
-                }
-            } elseif ($idpMetadata->getOptionalString('AuthnContextClassRef', null) !== null) {
-                $accr = $arrayUtils->arrayize($idpMetadata->getString('AuthnContextClassRef'));
-            } elseif (isset($state['saml:AuthnContextClassRef'])) {
-                $accr = $arrayUtils->arrayize($state['saml:AuthnContextClassRef']);
-            }
-        }
-
-        if ($accr !== null) {
-            if ($comp === null) {
-                $comp = AuthnContextComparisonTypeEnum::Exact->value;
-                if ($idpMetadata->getOptionalString('AuthnContextComparison', null) !== null) {
-                    $comp = $idpMetadata->getString('AuthnContextComparison');
-                } elseif (
-                    isset($state['saml:AuthnContextComparison'])
-                    && in_array(
-                        $state['saml:AuthnContextComparison'],
-                        array_column(AuthnContextComparisonTypeEnum::cases(), 'value'),
-                        true,
-                    )
-                ) {
-                    $comp = $state['saml:AuthnContextComparison'];
-                }
-            }
-            $ar->setRequestedAuthnContext(['AuthnContextClassRef' => $accr, 'Comparison' => $comp]);
-        } elseif (
-            /*
-             * When operating as a proxy, we pass the original requested context forward.
-             * However, if we are in a fallback loop, we suppress the proxied context to prevent
-             * it from overriding our intended fallback attempt (e.g., a "no context" request).
-             */
-            isset($state['saml:RequestedAuthnContext']['AuthnContextClassRef'])
-            && !$isFallback && $this->passAuthnContextClassRef
-        ) {
-            if (
-                isset($state['saml:RequestedAuthnContext']['Comparison'])
-                && in_array(
-                    $state['saml:RequestedAuthnContext']['Comparison'],
-                    array_column(AuthnContextComparisonTypeEnum::cases(), 'value'),
-                    true,
-                )
-            ) {
-                // RequestedAuthnContext has been set by an SP behind the proxy so pass it to the upper IdP
-                $ar->setRequestedAuthnContext([
-                    'AuthnContextClassRef' => $state['saml:RequestedAuthnContext']['AuthnContextClassRef'],
-                    'Comparison' => $state['saml:RequestedAuthnContext']['Comparison'],
-                ]);
-            }
-        }
-
+        // 4. Configure optional request attributes: Audience, ForceAuthn, and IsPassive
         if (isset($state['saml:Audience'])) {
             $ar->setAudiences($state['saml:Audience']);
         }
@@ -699,85 +530,20 @@ class SP extends Auth\Source
             $ar->setIsPassive((bool) $state['isPassive']);
         }
 
-        if (isset($state['saml:NameID'])) {
-            if (!is_array($state['saml:NameID']) && !is_a($state['saml:NameID'], NameID::class)) {
-                throw new Error\Exception('Invalid value of $state[\'saml:NameID\'].');
-            }
+        // 5. Configure SAML 2.0 Subject / NameID if specified (Core §3.4.1 / §2.2)
+        $this->configureSubject($ar, $state);
 
-            $nameId = $state['saml:NameID'];
-            if (is_array($nameId)) {
-                // Must be an array > convert to object
-
-                $nid = new NameID();
-                if (!array_key_exists('Value', $nameId)) {
-                    throw new \InvalidArgumentException('Missing "Value" in array, cannot create NameID from it.');
-                }
-
-                $nid->setValue($nameId['Value']);
-                if (array_key_exists('NameQualifier', $nameId) && $nameId['NameQualifier'] !== null) {
-                    $nid->setNameQualifier($nameId['NameQualifier']);
-                }
-                if (array_key_exists('SPNameQualifier', $nameId) && $nameId['SPNameQualifier'] !== null) {
-                    $nid->setSPNameQualifier($nameId['SPNameQualifier']);
-                }
-                if (array_key_exists('SPProvidedID', $nameId) && $nameId['SPProvidedId'] !== null) {
-                    $nid->setSPProvidedID($nameId['SPProvidedID']);
-                }
-                if (array_key_exists('Format', $nameId) && $nameId['Format'] !== null) {
-                    $nid->setFormat($nameId['Format']);
-                }
-            } else {
-                $nid = $nameId;
-            }
-
-            $ar->setNameId($nid);
-        }
-
+        // 6. Configure NameIDPolicy (Core §3.4.1.1)
         if (!empty($state['saml:NameIDPolicy'])) {
             $ar->setNameIdPolicy($state['saml:NameIDPolicy']);
         } else {
             $ar->setNameIdPolicy($this->metadata->getOptionalArray('NameIDPolicy', []));
         }
 
+        // 7. Configure SAML 2.0 Scoping, IDPList, ProxyCount, and RequesterID (Core §3.4.1.5)
+        $this->configureScoping($ar, $idpMetadata, $state);
 
-        $requesterID = [];
-
-        /* Only check for real info for Scoping element if we are going to send Scoping element */
-        if ($this->disable_scoping !== true && $idpMetadata->getOptionalBoolean('disable_scoping', false) !== true) {
-            if (isset($state['IDPList'])) {
-                $ar->setIDPList($state['IDPList']);
-            } elseif (isset($state['saml:IDPList'])) {
-                $ar->setIDPList($state['saml:IDPList']);
-            } elseif (!empty($this->metadata->getOptionalArray('IDPList', []))) {
-                $ar->setIDPList($this->metadata->getArray('IDPList'));
-            } elseif (!empty($idpMetadata->getOptionalArray('IDPList', []))) {
-                $ar->setIDPList($idpMetadata->getArray('IDPList'));
-            }
-
-            if (isset($state['saml:ProxyCount']) && $state['saml:ProxyCount'] !== null) {
-                $ar->setProxyCount($state['saml:ProxyCount']);
-            } elseif ($idpMetadata->hasValue('ProxyCount')) {
-                $ar->setProxyCount($idpMetadata->getInteger('ProxyCount'));
-            } elseif ($this->metadata->hasValue('ProxyCount')) {
-                $ar->setProxyCount($this->metadata->getInteger('ProxyCount'));
-            }
-
-            $requesterID = [];
-            if (isset($state['saml:RequesterID'])) {
-                $requesterID = $state['saml:RequesterID'];
-            }
-
-            if (isset($state['core:SP'])) {
-                $requesterID[] = $state['core:SP'];
-            }
-        } else {
-            Logger::debug('Disabling samlp:Scoping for ' . var_export($idpMetadata->getString('entityid'), true));
-        }
-
-        $ar->setRequesterID($requesterID);
-
-        // If the downstream SP has set extensions then use them.
-        // Otherwise use extensions that might be defined in the local SP (only makes sense in a proxy scenario)
+        // 8. Configure protocol extensions and provider display name
         if (isset($state['saml:Extensions']) && count($state['saml:Extensions']) > 0) {
             $ar->setExtensions($state['saml:Extensions']);
         } elseif ($this->metadata->getOptionalArray('saml:Extensions', null) !== null) {
@@ -789,10 +555,8 @@ class SP extends Auth\Source
             $ar->setProviderName($providerName);
         }
 
-
-        // save IdP entity ID as part of the state
+        // 9. Persist authentication state and bind state identifier to AuthnRequest ID
         $state['ExpectedIssuer'] = $idpMetadata->getString('entityid');
-
         $id = Auth\State::saveState($state, 'saml:sp:sso', true);
         $ar->setId($id);
 
@@ -800,40 +564,417 @@ class SP extends Auth\Source
             'Sending SAML 2 AuthnRequest to ' . var_export($idpMetadata->getString('entityid'), true),
         );
 
-        // Select appropriate SSO endpoint
+        // 10. Select SingleSignOnService endpoint, resolve binding, and transmit request (Profiles §4.1.3.1)
+        $dst = $this->getSSOEndpoint($idpMetadata, $ar);
+        $ar->setDestination($dst['Location']);
+
+        $b = Binding::getBinding($dst['Binding']);
+        $this->sendSAML2AuthnRequest($b, $ar);
+
+        Assert::true(false);
+    }
+
+
+    /**
+     * Configure the SAML 2.0 RequestedAuthnContext element and fallback state.
+     *
+     * In SAML 2.0 Core §3.3.2.2.1, <samlp:RequestedAuthnContext> specifies the requirements
+     * for the authentication context class declarations. This method coordinates:
+     * 1. Active fallback retry attempts (enforcing 'exact' comparison and per-attempt context).
+     * 2. Atomic fallback policy selection (IdP-remote metadata override over SP authsource default).
+     * 3. Ladder bounds and duplicate validation for sequential retries.
+     * 4. Proxied downstream SP RequestedAuthnContext passthrough.
+     *
+     * @param \SAML2\AuthnRequest $ar The AuthnRequest being built.
+     * @param \SimpleSAML\Configuration $idpMetadata The metadata of the target IdP.
+     * @param array &$state The current authentication state array.
+     *
+     * @throws \SimpleSAML\Error\ConfigurationError If fallback configuration is invalid.
+     */
+    protected function configureRequestedAuthnContext(
+        AuthnRequest $ar,
+        Configuration $idpMetadata,
+        array &$state,
+    ): void {
+        $arrayUtils = new Utils\Arrays();
+
+        // Guard: Handle active AuthnContextClassRef fallback retry attempt
+        if (array_key_exists('saml:AuthnContextClassRefFallback', $state)) {
+            $ar->setRequestedAuthnContext(null);
+            if (isset($state['saml:AuthnContextClassRef'])) {
+                $ar->setRequestedAuthnContext([
+                    'AuthnContextClassRef' => $arrayUtils->arrayize($state['saml:AuthnContextClassRef']),
+                    'Comparison' => AuthnContextComparisonTypeEnum::Exact->value,
+                ]);
+            }
+            return;
+        }
+
+        // Determine if an atomic fallback policy applies (gated off if downstream SP supplied explicit context)
+        $hasDownstreamRequestedAuthnContext = !empty($state['saml:RequestedAuthnContext']);
+        $policyOverridesStockResolution = false;
+        $policyFromIdp = false;
+        $initialContext = null;
+        $fallbackList = null;
+
+        if (!$hasDownstreamRequestedAuthnContext) {
+            $idpOwnsPolicy = $idpMetadata->hasValue('AuthnContextClassRef')
+                || $idpMetadata->hasValue('AuthnContextClassRefFallback');
+
+            if ($idpOwnsPolicy) {
+                $policyOverridesStockResolution = true;
+                $policyFromIdp = true;
+                $initialContext = $idpMetadata->hasValue('AuthnContextClassRef')
+                    ? $idpMetadata->getValue('AuthnContextClassRef')
+                    : null;
+                $fallbackList = $idpMetadata->hasValue('AuthnContextClassRefFallback')
+                    ? $idpMetadata->getValue('AuthnContextClassRefFallback')
+                    : null;
+            } elseif ($this->metadata->hasValue('AuthnContextClassRefFallback')) {
+                $policyOverridesStockResolution = true;
+                $initialContext = $this->metadata->hasValue('AuthnContextClassRef')
+                    ? $this->metadata->getValue('AuthnContextClassRef')
+                    : null;
+                $fallbackList = $this->metadata->getValue('AuthnContextClassRefFallback');
+            }
+        }
+
+        $accr = null;
+
+        if ($policyOverridesStockResolution) {
+            if ($fallbackList !== null) {
+                if (!is_array($fallbackList)) {
+                    throw new Error\ConfigurationError('AuthnContextClassRefFallback must be an array.');
+                }
+
+                if (count($fallbackList) > 0) {
+                    $state['saml:AuthnContextClassRefFallback'] = $this->validateAndNormalizeFallbackLadder(
+                        $initialContext,
+                        $fallbackList,
+                    );
+                    $ar->setRequestedAuthnContext([
+                        'AuthnContextClassRef' => [$initialContext],
+                        'Comparison' => AuthnContextComparisonTypeEnum::Exact->value,
+                    ]);
+                    return;
+                }
+
+                // Explicit empty fallback array disables retries
+                if ($policyFromIdp) {
+                    if ($initialContext === null) {
+                        $ar->setRequestedAuthnContext(null);
+                        return;
+                    }
+                    $accr = $arrayUtils->arrayize($initialContext);
+                }
+            } elseif ($initialContext !== null) {
+                $accr = $arrayUtils->arrayize($initialContext);
+            }
+        } elseif ($idpMetadata->getOptionalString('AuthnContextClassRef', null) !== null) {
+            $accr = $arrayUtils->arrayize($idpMetadata->getString('AuthnContextClassRef'));
+        } elseif (isset($state['saml:AuthnContextClassRef'])) {
+            $accr = $arrayUtils->arrayize($state['saml:AuthnContextClassRef']);
+        }
+
+        if ($accr !== null) {
+            $comp = $this->resolveAuthnContextComparison($idpMetadata, $state);
+            $ar->setRequestedAuthnContext([
+                'AuthnContextClassRef' => $accr,
+                'Comparison' => $comp,
+            ]);
+            return;
+        }
+
+        // When proxying, pass downstream SP RequestedAuthnContext if enabled and valid
+        if (
+            $this->passAuthnContextClassRef
+            && isset($state['saml:RequestedAuthnContext']['AuthnContextClassRef'])
+            && isset($state['saml:RequestedAuthnContext']['Comparison'])
+            && in_array(
+                $state['saml:RequestedAuthnContext']['Comparison'],
+                array_column(AuthnContextComparisonTypeEnum::cases(), 'value'),
+                true,
+            )
+        ) {
+            $ar->setRequestedAuthnContext([
+                'AuthnContextClassRef' => $state['saml:RequestedAuthnContext']['AuthnContextClassRef'],
+                'Comparison' => $state['saml:RequestedAuthnContext']['Comparison'],
+            ]);
+        }
+    }
+
+
+    /**
+     * Validate and normalize the AuthnContextClassRef fallback ladder.
+     *
+     * Under REFEDS "MFA with Retry" profile guidance, an SP requesting strong authentication
+     * sequentially steps down upon receiving Responder/NoAuthnContext. The fallback ladder
+     * allows at most 2 subsequent rungs (max 3 total attempts). Each rung must be a single
+     * string context, with only the final rung optionally being empty to request unconstrained
+     * authentication.
+     *
+     * @param mixed $initialContext The initial AuthnContextClassRef string.
+     * @param array $fallbackList The list of fallback rungs.
+     * @return array<string> The normalized list of fallback context strings.
+     *
+     * @throws \SimpleSAML\Error\ConfigurationError If ladder bounds, types, or uniqueness rules are violated.
+     */
+    protected function validateAndNormalizeFallbackLadder(mixed $initialContext, array $fallbackList): array
+    {
+        if (!is_string($initialContext) || trim($initialContext) === '') {
+            throw new Error\ConfigurationError(
+                'AuthnContextClassRef must be a single non-empty string ' .
+                'when AuthnContextClassRefFallback is configured.',
+            );
+        }
+
+        if (count($fallbackList) > 2) {
+            throw new Error\ConfigurationError(
+                'AuthnContextClassRefFallback allows at most 2 fallback rungs (maximum 3 total attempts).',
+            );
+        }
+
+        $seenContexts = [$initialContext => true];
+        $fallbackCount = count($fallbackList);
+        $normalizedFallback = [];
+
+        foreach (array_values($fallbackList) as $index => $rung) {
+            $isFinal = ($index === $fallbackCount - 1);
+
+            if ($isFinal) {
+                if (is_array($rung)) {
+                    if (!empty($rung)) {
+                        throw new Error\ConfigurationError(
+                            'Fallback rungs must be single strings; multi-context arrays are not allowed.',
+                        );
+                    }
+                    $normalizedFallback[] = '';
+                    continue;
+                }
+
+                if (!is_string($rung)) {
+                    throw new Error\ConfigurationError(
+                        'Invalid fallback rung type: each rung must be a string or terminal empty array.',
+                    );
+                }
+
+                if (trim($rung) === '') {
+                    $normalizedFallback[] = '';
+                    continue;
+                }
+
+                if (isset($seenContexts[$rung])) {
+                    throw new Error\ConfigurationError(sprintf(
+                        'Duplicate AuthnContextClassRef "%s" in fallback ladder.',
+                        $rung,
+                    ));
+                }
+
+                $seenContexts[$rung] = true;
+                $normalizedFallback[] = $rung;
+                continue;
+            }
+
+            if (!is_string($rung) || trim($rung) === '') {
+                throw new Error\ConfigurationError(
+                    'Non-terminal fallback rungs must be non-empty strings.',
+                );
+            }
+
+            if (isset($seenContexts[$rung])) {
+                throw new Error\ConfigurationError(sprintf(
+                    'Duplicate AuthnContextClassRef "%s" in fallback ladder.',
+                    $rung,
+                ));
+            }
+
+            $seenContexts[$rung] = true;
+            $normalizedFallback[] = $rung;
+        }
+
+        return $normalizedFallback;
+    }
+
+
+    /**
+     * Resolve the AuthnContext comparison rule.
+     *
+     * In SAML 2.0 Core §3.3.2.2.1, the Comparison attribute evaluates the requested context:
+     * 'exact', 'minimum', 'maximum', or 'better'. IdP metadata takes precedence over the
+     * authentication state, defaulting to 'exact'.
+     *
+     * @param \SimpleSAML\Configuration $idpMetadata The metadata of the IdP.
+     * @param array $state The current authentication state.
+     * @return string The comparison rule value.
+     */
+    protected function resolveAuthnContextComparison(Configuration $idpMetadata, array $state): string
+    {
+        $idpComparison = $idpMetadata->getOptionalString('AuthnContextComparison', null);
+        if ($idpComparison !== null) {
+            return $idpComparison;
+        }
+
+        if (
+            isset($state['saml:AuthnContextComparison'])
+            && in_array(
+                $state['saml:AuthnContextComparison'],
+                array_column(AuthnContextComparisonTypeEnum::cases(), 'value'),
+                true,
+            )
+        ) {
+            return $state['saml:AuthnContextComparison'];
+        }
+
+        return AuthnContextComparisonTypeEnum::Exact->value;
+    }
+
+
+    /**
+     * Configure the SAML Subject element on the AuthnRequest if requested in state.
+     *
+     * Under SAML 2.0 Core §3.4.1, an AuthnRequest may include a <saml:Subject> containing
+     * a <saml:NameID> to specify the subject strongly desired or required by the SP.
+     *
+     * @param \SAML2\AuthnRequest $ar The AuthnRequest being built.
+     * @param array $state The current authentication state.
+     *
+     * @throws \SimpleSAML\Error\Exception If the NameID in state is invalid.
+     * @throws \InvalidArgumentException If an array NameID lacks a 'Value'.
+     */
+    protected function configureSubject(AuthnRequest $ar, array $state): void
+    {
+        if (!isset($state['saml:NameID'])) {
+            return;
+        }
+
+        $nameId = $state['saml:NameID'];
+        if (!is_array($nameId) && !is_a($nameId, NameID::class)) {
+            throw new Error\Exception('Invalid value of $state[\'saml:NameID\'].');
+        }
+
+        if ($nameId instanceof NameID) {
+            $ar->setNameId($nameId);
+            return;
+        }
+
+        if (!array_key_exists('Value', $nameId)) {
+            throw new \InvalidArgumentException('Missing "Value" in array, cannot create NameID from it.');
+        }
+
+        $nid = new NameID();
+        $nid->setValue($nameId['Value']);
+        if (array_key_exists('NameQualifier', $nameId) && $nameId['NameQualifier'] !== null) {
+            $nid->setNameQualifier($nameId['NameQualifier']);
+        }
+        if (array_key_exists('SPNameQualifier', $nameId) && $nameId['SPNameQualifier'] !== null) {
+            $nid->setSPNameQualifier($nameId['SPNameQualifier']);
+        }
+        if (array_key_exists('SPProvidedID', $nameId) && $nameId['SPProvidedId'] !== null) {
+            $nid->setSPProvidedID($nameId['SPProvidedID']);
+        }
+        if (array_key_exists('Format', $nameId) && $nameId['Format'] !== null) {
+            $nid->setFormat($nameId['Format']);
+        }
+
+        $ar->setNameId($nid);
+    }
+
+
+    /**
+     * Configure SAML 2.0 Scoping, including IDPList, ProxyCount, and RequesterID.
+     *
+     * In SAML 2.0 Core §3.4.1.5, the <samlp:Scoping> element conveys proxying parameters:
+     * - <samlp:IDPList>: Permitted upstream IdPs for discovery or routing.
+     * - ProxyCount: Remaining proxying hops allowed before request must not be forwarded.
+     * - <samlp:RequesterID>: The set of entities on whose behalf the proxy is acting.
+     *
+     * @param \SAML2\AuthnRequest $ar The AuthnRequest being built.
+     * @param \SimpleSAML\Configuration $idpMetadata The metadata of the target IdP.
+     * @param array $state The current authentication state.
+     */
+    protected function configureScoping(AuthnRequest $ar, Configuration $idpMetadata, array $state): void
+    {
+        // Guard: disable scoping if configured either globally or in IdP metadata
+        if ($this->disable_scoping === true || $idpMetadata->getOptionalBoolean('disable_scoping', false) === true) {
+            Logger::debug('Disabling samlp:Scoping for ' . var_export($idpMetadata->getString('entityid'), true));
+            $ar->setRequesterID([]);
+            return;
+        }
+
+        // Configure IDPList (permitted upstream identity providers)
+        if (isset($state['IDPList'])) {
+            $ar->setIDPList($state['IDPList']);
+        } elseif (isset($state['saml:IDPList'])) {
+            $ar->setIDPList($state['saml:IDPList']);
+        } elseif (!empty($this->metadata->getOptionalArray('IDPList', []))) {
+            $ar->setIDPList($this->metadata->getArray('IDPList'));
+        } elseif (!empty($idpMetadata->getOptionalArray('IDPList', []))) {
+            $ar->setIDPList($idpMetadata->getArray('IDPList'));
+        }
+
+        // Configure ProxyCount (maximum upstream hops remaining)
+        if (isset($state['saml:ProxyCount']) && $state['saml:ProxyCount'] !== null) {
+            $ar->setProxyCount($state['saml:ProxyCount']);
+        } elseif ($idpMetadata->hasValue('ProxyCount')) {
+            $ar->setProxyCount($idpMetadata->getInteger('ProxyCount'));
+        } elseif ($this->metadata->hasValue('ProxyCount')) {
+            $ar->setProxyCount($this->metadata->getInteger('ProxyCount'));
+        }
+
+        // Configure RequesterID (downstream entities on whose behalf the proxy acts)
+        $requesterID = [];
+        if (isset($state['saml:RequesterID'])) {
+            $requesterID = $state['saml:RequesterID'];
+        }
+
+        if (isset($state['core:SP'])) {
+            $requesterID[] = $state['core:SP'];
+        }
+
+        $ar->setRequesterID($requesterID);
+    }
+
+
+    /**
+     * Resolve the target IdP's SingleSignOnService endpoint and binding.
+     *
+     * In SAML 2.0 Profiles §4.1.3.1, the requester selects an IdP SingleSignOnService endpoint
+     * supporting the desired protocol binding (Holder-of-Key, HTTP-Artifact, or HTTP-Redirect/POST).
+     *
+     * @param \SimpleSAML\Configuration $idpMetadata The metadata of the target IdP.
+     * @param \SAML2\AuthnRequest $ar The AuthnRequest message being sent.
+     * @return array The resolved endpoint configuration array.
+     */
+    protected function getSSOEndpoint(Configuration $idpMetadata, AuthnRequest $ar): array
+    {
         if ($ar->getProtocolBinding() === Constants::BINDING_HOK_SSO) {
-            /** @var array $dst */
-            $dst = $idpMetadata->getDefaultEndpoint(
+            /** @var array */
+            return $idpMetadata->getDefaultEndpoint(
                 'SingleSignOnService',
                 [
                     Constants::BINDING_HOK_SSO,
                 ],
             );
-        } elseif ($ar->getProtocolBinding() === Constants::BINDING_HTTP_ARTIFACT) {
-            /** @var array $dst */
-            $dst = $idpMetadata->getDefaultEndpoint(
+        }
+
+        if ($ar->getProtocolBinding() === Constants::BINDING_HTTP_ARTIFACT) {
+            /** @var array */
+            return $idpMetadata->getDefaultEndpoint(
                 'SingleSignOnService',
                 [
                     Constants::BINDING_HTTP_ARTIFACT,
                 ],
             );
-        } else {
-            /** @var array $dst */
-            $dst = $idpMetadata->getEndpointPrioritizedByBinding(
-                'SingleSignOnService',
-                [
-                    Constants::BINDING_HTTP_REDIRECT,
-                    Constants::BINDING_HTTP_POST,
-                ],
-            );
         }
-        $ar->setDestination($dst['Location']);
 
-        $b = Binding::getBinding($dst['Binding']);
-
-        $this->sendSAML2AuthnRequest($b, $ar);
-
-        Assert::true(false);
+        /** @var array */
+        return $idpMetadata->getEndpointPrioritizedByBinding(
+            'SingleSignOnService',
+            [
+                Constants::BINDING_HTTP_REDIRECT,
+                Constants::BINDING_HTTP_POST,
+            ],
+        );
     }
 
 
@@ -845,7 +986,7 @@ class SP extends Auth\Source
      * @param \SAML2\Binding $binding  The binding.
      * @param \SAML2\AuthnRequest $ar  The authentication request.
      */
-    public function sendSAML2AuthnRequest(Binding $binding, AuthnRequest $ar): never
+    public function sendSAML2AuthnRequest(Binding $binding, AuthnRequest $ar): void
     {
         $binding->send($ar);
     }
@@ -859,7 +1000,7 @@ class SP extends Auth\Source
      * @param \SAML2\Binding $binding  The binding.
      * @param \SAML2\LogoutRequest $ar  The logout request.
      */
-    public function sendSAML2LogoutRequest(Binding $binding, LogoutRequest $lr): never
+    public function sendSAML2LogoutRequest(Binding $binding, LogoutRequest $lr): void
     {
         $binding->send($lr);
     }
@@ -871,7 +1012,7 @@ class SP extends Auth\Source
      * @param string $idp  The entity ID of the IdP.
      * @param array $state  The state array for the current authentication.
      */
-    public function startSSO(string $idp, array $state): never
+    public function startSSO(string $idp, array $state): void
     {
         $idpMetadata = $this->getIdPMetadata($idp);
 
@@ -887,7 +1028,7 @@ class SP extends Auth\Source
      *
      * @param array $state  The state array.
      */
-    private function startDisco(array $state): never
+    private function startDisco(array $state): void
     {
         $id = Auth\State::saveState($state, 'saml:sp:sso');
 
@@ -925,7 +1066,7 @@ class SP extends Auth\Source
      *
      * @param array &$state  Information about the current authentication.
      */
-    public function authenticate(array &$state): never
+    public function authenticate(array &$state): void
     {
         // We are going to need the authId in order to retrieve this authentication source later
         $state['saml:sp:AuthId'] = $this->authId;
@@ -1088,7 +1229,7 @@ class SP extends Auth\Source
      *
      * @throws \SAML2\Exception\Protocol\NoPassiveException In case the authentication request was passive.
      */
-    public static function askForIdPChange(array &$state): never
+    public static function askForIdPChange(array &$state): void
     {
         Assert::keyExists($state, 'saml:sp:IdPMetadata');
         Assert::keyExists($state, 'saml:sp:AuthId');
@@ -1123,7 +1264,7 @@ class SP extends Auth\Source
      * - 'saml:sp:AuthId': the identifier of the current authentication source.
      * @throws \SAML2\Exception\Protocol\NoPassiveException In case the authentication request was passive.
      */
-    public static function tryStepUpAuth(array &$state): never
+    public static function tryStepUpAuth(array &$state): void
     {
         Assert::keyExists($state, 'saml:idp');
         Assert::keyExists($state, 'saml:sp:AuthId');
@@ -1148,7 +1289,7 @@ class SP extends Auth\Source
      *
      * @param array $state The state array.
      */
-    public static function reauthLogout(array $state): never
+    public static function reauthLogout(array $state): void
     {
         Logger::debug('Proxy: logging the user out before re-authentication.');
 
@@ -1167,7 +1308,7 @@ class SP extends Auth\Source
      *
      * @param array $state  The authentication state.
      */
-    public static function reauthPostLogin(array $state): never
+    public static function reauthPostLogin(array $state): void
     {
         Assert::keyExists($state, 'ReturnCallback');
 
@@ -1189,7 +1330,7 @@ class SP extends Auth\Source
      * @param \SimpleSAML\IdP $idp The IdP we are logging out from.
      * @param array &$state The state array with the state during logout.
      */
-    public static function reauthPostLogout(IdP $idp, array $state): never
+    public static function reauthPostLogout(IdP $idp, array $state): void
     {
         Assert::keyExists($state, 'saml:sp:AuthId');
 
@@ -1359,7 +1500,7 @@ class SP extends Auth\Source
      * manually check the URL on beforehand. Please refer to the 'trusted.url.domains'
      * configuration directive for more information about allowing (or disallowing) URLs.
      */
-    public static function handleUnsolicitedAuth(string $authId, array $state, string $redirectTo): never
+    public static function handleUnsolicitedAuth(string $authId, array $state, string $redirectTo): void
     {
         $session = Session::getSessionFromRequest();
         $session->doLogin($authId, Auth\State::getPersistentAuthData($state));
@@ -1374,7 +1515,7 @@ class SP extends Auth\Source
      *
      * @param array $authProcState  The processing chain state.
      */
-    public static function onProcessingCompleted(array $authProcState): never
+    public static function onProcessingCompleted(array $authProcState): void
     {
         Assert::keyExists($authProcState, 'saml:sp:IdP');
         Assert::keyExists($authProcState, 'saml:sp:State');
