@@ -221,6 +221,77 @@ class SPTest extends ClearStateTestCase
 
 
     /**
+     * Test setting various Subject NameID attributes using a data provider.
+     */
+    #[DataProvider('provideNameIDAttributes')]
+    public function testNameIDAttributes(
+        string $attributeKey,
+        string $value,
+        string $getter,
+        string $xmlAttribute,
+    ): void {
+        $state = [
+            'saml:NameID' => [
+                'Value' => 'user@example.org',
+                $attributeKey => $value,
+            ],
+        ];
+
+        $ar = $this->createAuthnRequest($state);
+
+        /** @var \SAML2\XML\saml\NameID $nameID */
+        $nameID = $ar->getNameId();
+        $this->assertEquals('user@example.org', $nameID->getValue());
+        $this->assertEquals($value, $nameID->$getter());
+
+        $xml = $ar->toSignedXML();
+
+        /** @var \DOMAttr[] $q */
+        $q = Utils::xpQuery($xml, '/samlp:AuthnRequest/saml:Subject/saml:NameID/@' . $xmlAttribute);
+        $this->assertEquals($value, $q[0]->value);
+
+        $q = Utils::xpQuery($xml, '/samlp:AuthnRequest/saml:Subject/saml:NameID');
+        $this->assertEquals('user@example.org', $q[0]->textContent);
+    }
+
+
+    /**
+     * Data provider for NameID attributes.
+     *
+     * @return array<string, array{attributeKey: string, value: string, getter: string, xmlAttribute: string}>
+     */
+    public static function provideNameIDAttributes(): array
+    {
+        return [
+            'NameQualifier' => [
+                'attributeKey' => 'NameQualifier',
+                'value' => 'nq-example-qualifier',
+                'getter' => 'getNameQualifier',
+                'xmlAttribute' => 'NameQualifier',
+            ],
+            'SPNameQualifier' => [
+                'attributeKey' => 'SPNameQualifier',
+                'value' => 'spnq-example-qualifier',
+                'getter' => 'getSPNameQualifier',
+                'xmlAttribute' => 'SPNameQualifier',
+            ],
+            'SPProvidedID' => [
+                'attributeKey' => 'SPProvidedID',
+                'value' => 'sp-provided-id-1234',
+                'getter' => 'getSPProvidedID',
+                'xmlAttribute' => 'SPProvidedID',
+            ],
+            'Format' => [
+                'attributeKey' => 'Format',
+                'value' => Constants::NAMEID_UNSPECIFIED,
+                'getter' => 'getFormat',
+                'xmlAttribute' => 'Format',
+            ],
+        ];
+    }
+
+
+    /**
      * Test setting an AuthnConextClassRef
      */
     public function testAuthnContextClassRef(): void
@@ -649,9 +720,9 @@ class SPTest extends ClearStateTestCase
 
 
     /**
-     * Test ladder validation: reject more than 2 fallback rungs (maximum 3 total attempts).
+     * Test ladder validation: allow multi-tier fallback ladders (more than 2 fallback rungs).
      */
-    public function testLadderRejectsExcessiveRungs(): void
+    public function testLadderAllowsMultiTierFallbackRungs(): void
     {
         $info = ['AuthId' => 'default-sp'];
         $config = [
@@ -666,8 +737,21 @@ class SPTest extends ClearStateTestCase
         $as = new SpTester($info, $config);
         $idpMetadata = new Configuration($this->idpConfigArray, 'test-idp');
 
-        $this->expectException(ConfigurationError::class);
-        $as->startSSO2Test($idpMetadata, []);
+        try {
+            $as->startSSO2Test($idpMetadata, []);
+            $this->fail('Expected ExitTestException');
+        } catch (ExitTestException $e) {
+            $r = $e->getTestResult();
+            /** @var \SAML2\AuthnRequest $ar */
+            $ar = $r['ar'];
+
+            $savedState = \SimpleSAML\Auth\State::loadState($ar->getId(), 'saml:sp:sso');
+            $this->assertArrayHasKey('saml:AuthnContextClassRefFallback', $savedState);
+            $this->assertEquals(
+                ['urn:step2', 'urn:step3', ''],
+                $savedState['saml:AuthnContextClassRefFallback'],
+            );
+        }
     }
 
 
@@ -772,8 +856,54 @@ class SPTest extends ClearStateTestCase
         $as = new SpTester($info, $config);
         $idpMetadata = new Configuration($this->idpConfigArray, 'test-idp');
 
-        $this->expectException(ConfigurationError::class);
+        $this->expectException(AssertionFailedException::class);
         $as->startSSO2Test($idpMetadata, []);
+    }
+
+
+    /**
+     * Test Option A: when passAuthnContextClassRef is disabled, downstream RequestedAuthnContext
+     * is ignored and the configured fallback ladder is preserved.
+     */
+    public function testAuthnContextClassRefFallbackIgnoresDownstreamContextWhenPassAuthnContextClassRefDisabled(): void
+    {
+        $info = ['AuthId' => 'default-sp'];
+        $config = [
+            'entityID' => 'urn:x-simplesamlphp:example-sp',
+            'proxymode.passAuthnContextClassRef' => false,
+            'AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+            'AuthnContextClassRefFallback' => ['https://refeds.org/profile/mfa', ''],
+        ];
+        $as = new SpTester($info, $config);
+        $idpMetadata = new Configuration($this->idpConfigArray, 'test-idp');
+
+        $state = [
+            'saml:RequestedAuthnContext' => [
+                'AuthnContextClassRef' => ['urn:downstream:ignored'],
+                'Comparison' => 'minimum',
+            ],
+        ];
+
+        try {
+            $as->startSSO2Test($idpMetadata, $state);
+            $this->fail('Expected ExitTestException');
+        } catch (ExitTestException $e) {
+            $r = $e->getTestResult();
+            /** @var \SAML2\AuthnRequest $ar */
+            $ar = $r['ar'];
+
+            $requestedContext = $ar->getRequestedAuthnContext();
+            $this->assertIsArray($requestedContext);
+            $this->assertEquals(['https://refeds.org/profile/mfa/phr'], $requestedContext['AuthnContextClassRef']);
+            $this->assertEquals('exact', $requestedContext['Comparison']);
+
+            $savedState = \SimpleSAML\Auth\State::loadState($ar->getId(), 'saml:sp:sso');
+            $this->assertArrayHasKey('saml:AuthnContextClassRefFallback', $savedState);
+            $this->assertEquals(
+                ['https://refeds.org/profile/mfa', ''],
+                $savedState['saml:AuthnContextClassRefFallback'],
+            );
+        }
     }
 
 

@@ -420,6 +420,22 @@ class ServiceProvider
                 && is_array($state['saml:AuthnContextClassRefFallback'])
                 && count($state['saml:AuthnContextClassRefFallback']) > 0
             ) {
+                /*
+                 * Downgrade Attack Mitigation (Cryptographic Error Verification):
+                 * A major concern with automated step-down retries is the downgrade attack vector:
+                 * an on-path attacker (MITM) might attempt to inject or forge a SAML NoAuthnContext
+                 * error to trick the proxy into stepping down to a weaker authentication method.
+                 *
+                 * To neutralize this vector, validateFallbackErrorResponse() enforces that the error
+                 * response is cryptographically provable and tightly bound to this exact transaction:
+                 * 1. Signed by the IdP: Valid XML digital signature verified against IdP metadata keys.
+                 * 2. Correlated: InResponseTo matches the unique outgoing AuthnRequest ID.
+                 * 3. Addressed: Destination matches this SP's ACS endpoint.
+                 * 4. Authenticated: Issuer matches the expected IdP entityID.
+                 *
+                 * Unsigned, spoofed, replayed, or unsolicited error responses are rejected and cannot
+                 * trigger fallback.
+                 */
                 Module\saml\Message::validateFallbackErrorResponse(
                     $spMetadata,
                     $idpMetadata,
@@ -429,10 +445,12 @@ class ServiceProvider
                 );
 
                 /*
-                 * If the IdP cannot fulfill the requested AuthnContext (e.g., the user lacks a hardware key
-                 * for phishing-resistant MFA), it responds with a NoAuthnContext error. Here we check if a
-                 * prioritized fallback list is configured in the state. If so, we extract the next context
-                 * from the fallback array and retry the authentication request.
+                 * Downgrade Attack Mitigation (State Deletion & Request ID Freshness):
+                 * Consumed attempt state is deleted immediately, and the internal state ID is unset.
+                 * This forces the state manager to generate a brand-new ID for the retry attempt,
+                 * ensuring the subsequent SAML AuthnRequest receives a unique Request ID.
+                 * This prevents replay attacks, avoids state confusion across ladder rungs, and
+                 * ensures each retry attempt is an independent, correlated cryptographic transaction.
                  */
                 $this->authState::deleteState($state);
 

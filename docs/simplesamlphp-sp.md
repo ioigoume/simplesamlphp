@@ -33,15 +33,15 @@ no explicit context, you can configure a fallback ladder.
 
 Configure `AuthnContextClassRef` as a single string, and set
 `AuthnContextClassRefFallback` as a prioritized list of fallback rungs.
-The ladder supports at most two fallback rungs (three total attempts), and the
+The retry limit is bounded by the length of this array, and the
 final rung may be the empty string (`''`) to allow a final attempt with no
 requested context.
 
 Each attempt requests exactly one context with `Comparison="exact"`. SimpleSAMLphp
 advances the ladder only after validating a signed `Responder` / `NoAuthnContext`
-response that is correlated to the current request. An explicit
-`RequestedAuthnContext` from a downstream SP disables the configured ladder for
-that proxy transaction.
+response that is correlated to the current request. When `proxymode.passAuthnContextClassRef`
+is enabled, an explicit `RequestedAuthnContext` from a downstream SP takes precedence and disables
+the configured ladder.
 
 ```php
 'default-sp' => [

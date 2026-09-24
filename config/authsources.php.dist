@@ -65,14 +65,15 @@ $config = [
          * Constraints:
          * - AuthnContextClassRef must be a single non-empty string when using fallback.
          * - Each element in the array must be a single string (representing one context class).
-         * - At most 2 fallback rungs are allowed (maximum 3 total attempts).
+         * - The retry limit is bounded by the length of this array (multi-tier ladders are supported).
          * - Duplicate values are not allowed.
          * - The empty string ('') is only allowed as the last element, to allow a final fallback
          *   to standard login without an explicit context.
          * - An explicit empty array ([]) disables fallback retries and results in a single attempt.
          * - Each attempt requests exactly one context with Comparison="exact". A retry occurs only
          *   after a signed, correlated Responder/NoAuthnContext response has been validated.
-         * - An explicit RequestedAuthnContext from a downstream SP disables this fallback ladder.
+         * - When proxymode.passAuthnContextClassRef is enabled, an explicit RequestedAuthnContext
+         *   from a downstream SP takes precedence and disables this fallback ladder.
          *
          * Per REFEDS guidance, the requested context is not proof of the authentication performed.
          * Trust and evaluate the AuthnContextClassRef returned by the upstream IdP before granting access.

@@ -735,11 +735,16 @@ class Message
     /**
      * Validate an error response for fallback authentication retry.
      *
-     * Validates that the error Response:
+     * Downgrade Attack Mitigation (Cryptographic Error Verification):
+     * This method acts as a cryptographic firewall against downgrade attacks. An on-path
+     * adversary (MITM) cannot forge, inject, or replay a NoAuthnContext error to trick the
+     * proxy into stepping down to a weaker authentication context.
+     *
+     * The error response must meet all of the following criteria:
      * - is non-success
      * - matches the ACS destination URL (if destination is specified)
      * - matches the expected issuer
-     * - is signed by the IdP (valid XML signature)
+     * - is signed by the IdP (valid XML signature against IdP metadata keys)
      * - matches the expected request ID (InResponseTo)
      *
      * @param \SimpleSAML\Configuration $spMetadata The metadata of the service provider.
@@ -759,7 +764,9 @@ class Message
         ?string $expectedIssuer = null,
     ): void {
         if ($response->isSuccess()) {
-            throw new SSP_Error\Exception('Expected error response for fallback validation, but response status was success.');
+            throw new SSP_Error\Exception(
+                'Expected error response for fallback validation, but response status was success.',
+            );
         }
 
         // Validate Response-element destination

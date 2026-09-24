@@ -33,8 +33,7 @@ $metadata['entity-id-2'] = [
     proxy scenario (e.g., requesting REFEDS MFA phishing-resistant, then
     falling back to standard MFA if the user doesn't have a hardware key).
     Each element in the array must be a single string (representing one context
-    class), and the list may contain at most two fallback rungs (three total
-    attempts including the initial `AuthnContextClassRef`).
+    class). The retry limit is bounded by the length of this array.
     The final element may be the empty string (`''`) to allow a final fallback
     to standard login without an explicit context.
 
@@ -43,8 +42,8 @@ $metadata['entity-id-2'] = [
     (it does not inherit SP retry policy).
 
 :   Each attempt requests exactly one context with `Comparison="exact"`. A retry occurs only after a signed,
-    correlated `Responder` / `NoAuthnContext` response has been validated. An explicit `RequestedAuthnContext`
-    from a downstream SP disables the configured ladder for that transaction.
+    correlated `Responder` / `NoAuthnContext` response has been validated. When `proxymode.passAuthnContextClassRef`
+    is enabled, an explicit `RequestedAuthnContext` from a downstream SP takes precedence and disables the configured ladder.
 
 :   Per REFEDS guidance, the requested context is not proof of the authentication performed. Trust and evaluate
     the `AuthnContextClassRef` actually returned by this IdP. A fallback-backed proxy assertion reports that

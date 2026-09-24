@@ -154,9 +154,8 @@ The following attributes are available:
     responds with a `NoAuthnContext` error. This is particularly useful in a
     proxy scenario (e.g., requesting REFEDS MFA phishing-resistant, then
     falling back to standard MFA if the user doesn't have a hardware key).
-    Each element in the array must be a single string (representing one context class),
-    and the list may contain at most two fallback rungs (three total attempts including
-    the initial `AuthnContextClassRef`).
+    Each element in the array must be a single string (representing one context class).
+    The retry limit is bounded by the length of this array.
     The final element may be the empty string (`''`) to allow a final fallback
     to standard login without an explicit context.
 
@@ -169,7 +168,8 @@ The following attributes are available:
 
 :   Each ladder attempt sends exactly one context with `Comparison="exact"`. A retry is made only for a
     cryptographically validated `Responder` / `NoAuthnContext` response correlated to the current request.
-    An explicit `RequestedAuthnContext` from a downstream SP disables the configured ladder for that transaction.
+    When `proxymode.passAuthnContextClassRef` is enabled, an explicit `RequestedAuthnContext` from a downstream SP
+    takes precedence and disables the configured ladder.
 
 :   Per REFEDS guidance, a requested context does not prove which authentication was performed. Authorization
     decisions must trust and evaluate the `AuthnContextClassRef` actually returned by the upstream IdP; proxy
@@ -348,6 +348,16 @@ The following attributes are available:
 :   The binding that should be used for SAML2 authentication responses.
     This option controls the binding that is requested through the AuthnRequest message to the IdP.
     By default the HTTP-Post binding is used.
+
+`proxymode.passAuthnContextClassRef`
+:   When SimpleSAMLphp operates as an IdP/SP proxy, decide whether an explicit `RequestedAuthnContext`
+    received from a downstream SP is passed directly through to the upstream IdP or processed autonomously
+    by the proxy. The default is `false`.
+
+:   When set to `true`, explicit downstream SP context requirements take absolute precedence over proxy and
+    IdP-remote policies, and suppress any configured `AuthnContextClassRefFallback` ladder to prevent
+    downgrading downstream security requirements. When `false` or unset, downstream SP context is ignored,
+    allowing the proxy's configured fallback ladder to run.
 
 `redirect.sign`
 :   Whether authentication requests, logout requests and logout responses sent from this SP should be signed. The default is `false`.

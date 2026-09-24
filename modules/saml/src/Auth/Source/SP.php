@@ -610,42 +610,81 @@ class SP extends Auth\Source
             return;
         }
 
-        // Determine atomic fallback policy source (disabled if downstream SP supplied explicit context)
-        $hasDownstreamContext = !empty($state['saml:RequestedAuthnContext']);
-        $policySource = match (true) {
-            $hasDownstreamContext => 'none',
-            $idpMetadata->hasValue('AuthnContextClassRef')
-                || $idpMetadata->hasValue('AuthnContextClassRefFallback') => 'idp',
-            $this->metadata->hasValue('AuthnContextClassRefFallback') => 'sp',
-            default => 'none',
-        };
+        /*
+         * Downgrade Attack Mitigation (Downstream Requirement Integrity):
+         * When passAuthnContextClassRef is enabled, an explicit RequestedAuthnContext supplied
+         * by a downstream SP takes absolute precedence over upstream IdP-remote and proxy SP policy,
+         * completely suppressing the fallback ladder. This ensures that a proxy can never silently
+         * step down or weaken a downstream SP's explicit security requirements.
+         * When passAuthnContextClassRef is disabled or unset, downstream SP context is completely ignored.
+         */
+        $downstreamContext = $state['saml:RequestedAuthnContext'] ?? null;
+        $validComparisonValues = array_column(AuthnContextComparisonTypeEnum::cases(), 'value');
 
-        // Extract initial context and fallback ladder based on the resolved policy source
-        [$initialContext, $fallbackList] = match ($policySource) {
-            'idp' => [
-                $idpMetadata->hasValue('AuthnContextClassRef')
-                    ? $idpMetadata->getValue('AuthnContextClassRef')
-                    : null,
-                $idpMetadata->hasValue('AuthnContextClassRefFallback')
-                    ? $idpMetadata->getValue('AuthnContextClassRefFallback')
-                    : null,
-            ],
-            'sp' => [
-                $this->metadata->hasValue('AuthnContextClassRef')
-                    ? $this->metadata->getValue('AuthnContextClassRef')
-                    : null,
-                $this->metadata->getValue('AuthnContextClassRefFallback'),
-            ],
-            default => [null, null],
-        };
-
-        // Fallback list must be an array when configured
-        if ($fallbackList !== null && !is_array($fallbackList)) {
-            throw new Error\ConfigurationError('AuthnContextClassRefFallback must be an array.');
+        if (
+            $this->passAuthnContextClassRef
+            && isset($downstreamContext['AuthnContextClassRef'], $downstreamContext['Comparison'])
+            && in_array($downstreamContext['Comparison'], $validComparisonValues, true)
+        ) {
+            $ar->setRequestedAuthnContext([
+                'AuthnContextClassRef' => $downstreamContext['AuthnContextClassRef'],
+                'Comparison' => $downstreamContext['Comparison'],
+            ]);
+            return;
         }
 
+        // Retrieve context and fallback arrays directly (null if unconfigured)
+        $idpAccr = $idpMetadata->getOptionalValue('AuthnContextClassRef', null);
+        $idpFallback = $idpMetadata->getOptionalArray('AuthnContextClassRefFallback', null);
+
+        $spAccr = $this->metadata->getOptionalValue('AuthnContextClassRef', null);
+        $spFallback = $this->metadata->getOptionalArray('AuthnContextClassRefFallback', null);
+
+        /*
+         * Edge case discussion (Point 2):
+         * Patrick noted: "should someone be able to set AuthnContextClassRefFallback without having
+         * set AuthnContextClassRef? I can't see a use case where AuthnContextClassRefFallback would be
+         * set, but AuthnContextClassRef is not set."
+         *
+         * Potential edge case:
+         * An administrator might configure an explicit empty array ('AuthnContextClassRefFallback' => [])
+         * in an IdP's metadata (saml20-idp-remote.php) specifically to disable retries for that upstream IdP,
+         * while intending to inherit the SP authsource's default AuthnContextClassRef.
+         * Under a strict atomic policy model, mixing keys across sources is disallowed (an IdP override
+         * must define both keys or neither). Here we enforce that setting fallback requires
+         * AuthnContextClassRef to be configured on the same policy source, throwing ConfigurationError
+         * if absent, to keep policy resolution atomic and predictable.
+         */
+        if ($idpFallback !== null && $idpAccr === null) {
+            throw new Error\ConfigurationError(
+                'AuthnContextClassRef must be configured on IdP metadata when AuthnContextClassRefFallback is set.',
+            );
+        }
+
+        if ($spFallback !== null && $spAccr === null) {
+            throw new Error\ConfigurationError(
+                'AuthnContextClassRef must be configured when AuthnContextClassRefFallback is configured.',
+            );
+        }
+
+        // Determine atomic policy source and assign values without re-querying metadata
+        [$policySource, $initialContext, $fallbackList] = match (true) {
+            $idpAccr !== null || $idpFallback !== null => ['idp', $idpAccr, $idpFallback],
+            $spAccr !== null || $spFallback !== null => ['sp', $spAccr, $spFallback],
+            default => ['none', null, null],
+        };
+
         // Initialize sequential fallback ladder in state and request when rungs are configured
-        if (is_array($fallbackList) && count($fallbackList) > 0) {
+        if ($fallbackList !== null && count($fallbackList) > 0) {
+            /*
+             * Downgrade Attack Mitigation (Single-Context & Comparison="exact"):
+             * Each attempt in the fallback ladder requests exactly one context with Comparison="exact".
+             * Bundling multiple ACRs into a single AuthnRequest allows IdPs prioritizing SSO session
+             * reuse to collapse to the lowest common denominator (e.g. reusing an active password session
+             * instead of prompting for MFA). Requesting a single context with 'exact' comparison guarantees
+             * that the IdP can only satisfy the request at the requested assurance level, or explicitly
+             * reject with NoAuthnContext to trigger the next ladder attempt.
+             */
             $state['saml:AuthnContextClassRefFallback'] = $this->validateAndNormalizeFallbackLadder(
                 $initialContext,
                 $fallbackList,
@@ -666,10 +705,10 @@ class SP extends Auth\Source
         // Resolve AuthnContextClassRef from policy source, IdP metadata, or state
         $accr = match (true) {
             $policySource === 'idp' && $initialContext !== null => $arrayUtils->arrayize($initialContext),
-            $policySource === 'none' && $idpMetadata->getOptionalString('AuthnContextClassRef', null) !== null
+            isset($state['saml:AuthnContextClassRef']) => $arrayUtils->arrayize($state['saml:AuthnContextClassRef']),
+            $initialContext !== null => $arrayUtils->arrayize($initialContext),
+            $idpMetadata->getOptionalString('AuthnContextClassRef', null) !== null
                 => $arrayUtils->arrayize($idpMetadata->getString('AuthnContextClassRef')),
-            $policySource === 'none' && isset($state['saml:AuthnContextClassRef'])
-                => $arrayUtils->arrayize($state['saml:AuthnContextClassRef']),
             default => null,
         };
 
@@ -682,21 +721,6 @@ class SP extends Auth\Source
             ]);
             return;
         }
-
-        // When proxying, pass downstream SP RequestedAuthnContext if enabled and valid
-        $downstreamContext = $state['saml:RequestedAuthnContext'] ?? null;
-        $validComparisonValues = array_column(AuthnContextComparisonTypeEnum::cases(), 'value');
-
-        if (
-            $this->passAuthnContextClassRef
-            && isset($downstreamContext['AuthnContextClassRef'], $downstreamContext['Comparison'])
-            && in_array($downstreamContext['Comparison'], $validComparisonValues, true)
-        ) {
-            $ar->setRequestedAuthnContext([
-                'AuthnContextClassRef' => $downstreamContext['AuthnContextClassRef'],
-                'Comparison' => $downstreamContext['Comparison'],
-            ]);
-        }
     }
 
 
@@ -705,7 +729,7 @@ class SP extends Auth\Source
      *
      * Under REFEDS "MFA with Retry" profile guidance, an SP requesting strong authentication
      * sequentially steps down upon receiving Responder/NoAuthnContext. The fallback ladder
-     * allows at most 2 subsequent rungs (max 3 total attempts). Each rung must be a single
+     * allows subsequent rungs bounded by the configured list itself. Each rung must be a single
      * string context, with only the final rung optionally being empty to request unconstrained
      * authentication.
      *
@@ -725,12 +749,21 @@ class SP extends Auth\Source
             );
         }
 
-        // At most 2 fallback rungs allowed (3 total attempts: initial + 2 retries)
-        if (count($fallbackList) > 2) {
-            throw new Error\ConfigurationError(
-                'AuthnContextClassRefFallback allows at most 2 fallback rungs (maximum 3 total attempts).',
-            );
-        }
+        /*
+         * Fallback ladder length / retry limit:
+         * The retry limit is bounded by the length of the configured fallback list itself (count($fallbackList)).
+         * We do not enforce a hardcoded cap (such as 2 fallback rungs / 3 attempts total)
+         * in order to support multi-step enterprise authentication ladders (for example:
+         * FIDO2 -> Entra ID MFA -> standard REFEDS MFA -> unconstrained).
+         *
+         * Safety & Termination Guarantee:
+         * - Monotonic consumption: ServiceProvider::handleResponse shifts the next context on each retry.
+         * - Cryptographic correlation: Every retry requires a signed Responder/NoAuthnContext response
+         *   matching InResponseTo.
+         * - Uniqueness: Duplicate contexts across the ladder are strictly rejected below.
+         * Therefore, infinite retry loops are structurally impossible, and the configured list size
+         * safely governs the maximum retry bounds.
+         */
 
         $seenContexts = [$initialContext => true];
         $fallbackCount = count($fallbackList);
@@ -807,6 +840,11 @@ class SP extends Auth\Source
             )
         ) {
             return $state['saml:AuthnContextComparison'];
+        }
+
+        $spComparison = $this->metadata->getOptionalString('AuthnContextComparison', null);
+        if ($spComparison !== null) {
+            return $spComparison;
         }
 
         return AuthnContextComparisonTypeEnum::Exact->value;

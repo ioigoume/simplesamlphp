@@ -1168,7 +1168,19 @@ class SAML2
         $isFallbackProxy = isset($state['saml:AuthnContextClassRefFallback'])
             && isset($state['saml:sp:AuthnContext']);
 
-        // During proxy fallback flows, the downstream assertion must report the assurance actually achieved upstream.
+        /*
+         * Downgrade Attack Mitigation (Truth in Assertion & Authorization Decoupling):
+         * A critical security control against downgrade attacks is ensuring downstream relying parties
+         * receive ground truth about the authentication actually performed.
+         * The RequestedAuthnContext sent upstream represents an initial preference during negotiation.
+         * If the upstream IdP stepped down to a weaker context (e.g. from phr to mfa or password), the
+         * downstream assertion MUST NOT falsely assert the higher requested assurance context.
+         *
+         * Setting the assertion's AuthnContextClassRef to the context actually achieved upstream
+         * ($state['saml:sp:AuthnContext']) guarantees that downstream SPs and authproc filters make
+         * authorization decisions based on reality. Downstream security policies can inspect the returned
+         * assertion and reject inadequate assurance as appropriate.
+         */
         if ($isFallbackProxy) {
             $a->setAuthnContextClassRef($state['saml:sp:AuthnContext']);
         } elseif (isset($state['saml:AuthnContextClassRef'])) {
