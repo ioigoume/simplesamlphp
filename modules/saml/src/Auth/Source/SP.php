@@ -641,19 +641,17 @@ class SP extends Auth\Source
         $spFallback = $this->metadata->getOptionalArray('AuthnContextClassRefFallback', null);
 
         /*
-         * Edge case discussion (Point 2):
-         * Patrick noted: "should someone be able to set AuthnContextClassRefFallback without having
-         * set AuthnContextClassRef? I can't see a use case where AuthnContextClassRefFallback would be
-         * set, but AuthnContextClassRef is not set."
+         * Atomic Policy Coupling & Inheritance Integrity:
+         * A fallback ladder inherently requires a starting rung; configuring a fallback sequence
+         * without an initial context creates an incomplete and ambiguous policy specification.
+         * Furthermore, under SimpleSAMLphp's atomic policy resolution model, policy options cannot
+         * be blended or inherited across different configuration sources (e.g. taking initial
+         * AuthnContextClassRef from the SP authsource and an AuthnContextClassRefFallback override
+         * from IdP-remote metadata).
          *
-         * Potential edge case:
-         * An administrator might configure an explicit empty array ('AuthnContextClassRefFallback' => [])
-         * in an IdP's metadata (saml20-idp-remote.php) specifically to disable retries for that upstream IdP,
-         * while intending to inherit the SP authsource's default AuthnContextClassRef.
-         * Under a strict atomic policy model, mixing keys across sources is disallowed (an IdP override
-         * must define both keys or neither). Here we enforce that setting fallback requires
-         * AuthnContextClassRef to be configured on the same policy source, throwing ConfigurationError
-         * if absent, to keep policy resolution atomic and predictable.
+         * Enforcing that AuthnContextClassRef is explicitly defined on the same configuration source
+         * where AuthnContextClassRefFallback is set prevents configuration errors, avoids unintended
+         * inheritance, and ensures deterministic authentication request construction.
          */
         if ($idpFallback !== null && $idpAccr === null) {
             throw new Error\ConfigurationError(
@@ -696,30 +694,50 @@ class SP extends Auth\Source
             return;
         }
 
-        // Explicit empty fallback array from IdP with no initial context disables RequestedAuthnContext
-        if ($policySource === 'idp' && $fallbackList === [] && $initialContext === null) {
+        // Resolve AuthnContextClassRef from policy source, IdP metadata, or state
+        $accr = match (true) {
+            // 1. Selected IdP-Remote Metadata Override (metadata/saml20-idp-remote.php):
+            // When the selected upstream IdP metadata explicitly defines an AuthnContextClassRef policy
+            // ($policySource === 'idp'), it takes highest precedence over runtime state and SP defaults.
+            // This enables per-IdP customization (e.g., requesting IdP-specific ACRs, multi-ACR arrays,
+            // or suppressing context entirely via an explicit empty array []).
+            $policySource === 'idp' && $initialContext !== null => $arrayUtils->arrayize($initialContext),
+
+            // 2. Runtime Authentication State ($state['saml:AuthnContextClassRef']):
+            // If the selected IdP metadata does not specify context policy, dynamic requirements supplied
+            // at runtime by processing filters, modules, or login handlers take precedence over static SP
+            // authsource defaults.
+            isset($state['saml:AuthnContextClassRef']) => $arrayUtils->arrayize($state['saml:AuthnContextClassRef']),
+
+            // 3. SP Authsource Configuration Default (config/authsources.php):
+            // When neither an IdP-remote override nor runtime state is present, the SP authsource's configured
+            // AuthnContextClassRef ($initialContext from $policySource === 'sp') serves as the base default.
+            $initialContext !== null => $arrayUtils->arrayize($initialContext),
+
+            default => null,
+        };
+
+        // Explicit empty array ([]) in metadata or state means do not request any context
+        if ($accr === []) {
             $ar->setRequestedAuthnContext(null);
             return;
         }
 
-        // Resolve AuthnContextClassRef from policy source, IdP metadata, or state
-        $accr = match (true) {
-            $policySource === 'idp' && $initialContext !== null => $arrayUtils->arrayize($initialContext),
-            isset($state['saml:AuthnContextClassRef']) => $arrayUtils->arrayize($state['saml:AuthnContextClassRef']),
-            $initialContext !== null => $arrayUtils->arrayize($initialContext),
-            $idpMetadata->getOptionalString('AuthnContextClassRef', null) !== null
-                => $arrayUtils->arrayize($idpMetadata->getString('AuthnContextClassRef')),
-            default => null,
-        };
-
-        // Apply requested context with resolved comparison rule
+        // Validate that AuthnContextClassRef values are non-empty strings (SAML Core §3.3.2.2.1)
         if ($accr !== null) {
+            foreach ($accr as $val) {
+                if (!is_string($val) || trim($val) === '') {
+                    throw new Error\ConfigurationError(
+                        'AuthnContextClassRef values must be non-empty strings.',
+                    );
+                }
+            }
+
             $comp = $this->resolveAuthnContextComparison($idpMetadata, $state);
             $ar->setRequestedAuthnContext([
                 'AuthnContextClassRef' => $accr,
                 'Comparison' => $comp,
             ]);
-            return;
         }
     }
 

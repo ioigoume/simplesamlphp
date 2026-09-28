@@ -862,6 +862,95 @@ class SPTest extends ClearStateTestCase
 
 
     /**
+     * Test IdP metadata with array AuthnContextClassRef.
+     */
+    public function testAuthnContextClassRefArrayFromIdPMetadata(): void
+    {
+        $info = ['AuthId' => 'default-sp'];
+        $config = [
+            'entityID' => 'urn:x-simplesamlphp:example-sp',
+        ];
+        $as = new SpTester($info, $config);
+        $idpConfig = $this->idpConfigArray;
+        $idpConfig['AuthnContextClassRef'] = [
+            'urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport',
+            'urn:oasis:names:tc:SAML:2.0:ac:classes:X509',
+        ];
+        $idpMetadata = new Configuration($idpConfig, 'test-idp');
+
+        try {
+            $as->startSSO2Test($idpMetadata, []);
+            $this->fail('Expected ExitTestException');
+        } catch (ExitTestException $e) {
+            $r = $e->getTestResult();
+            /** @var \SAML2\AuthnRequest $ar */
+            $ar = $r['ar'];
+
+            $requestedContext = $ar->getRequestedAuthnContext();
+            $this->assertIsArray($requestedContext);
+            $this->assertEquals(
+                [
+                    'urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport',
+                    'urn:oasis:names:tc:SAML:2.0:ac:classes:X509',
+                ],
+                $requestedContext['AuthnContextClassRef'],
+            );
+        }
+    }
+
+
+    /**
+     * Test that an explicit empty array ([]) in IdP metadata overrides an SP default
+     * and suppresses RequestedAuthnContext entirely ("do not send" semantics).
+     */
+    public function testAuthnContextClassRefEmptyArrayInIdPMetadataSuppressesRequestedAuthnContext(): void
+    {
+        $info = ['AuthId' => 'default-sp'];
+        $config = [
+            'entityID' => 'urn:x-simplesamlphp:example-sp',
+            'AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+        ];
+        $as = new SpTester($info, $config);
+        $idpConfig = $this->idpConfigArray;
+        $idpConfig['AuthnContextClassRef'] = [];
+        $idpMetadata = new Configuration($idpConfig, 'test-idp');
+
+        try {
+            $as->startSSO2Test($idpMetadata, []);
+            $this->fail('Expected ExitTestException');
+        } catch (ExitTestException $e) {
+            $r = $e->getTestResult();
+            /** @var \SAML2\AuthnRequest $ar */
+            $ar = $r['ar'];
+
+            $this->assertNull($ar->getRequestedAuthnContext());
+
+            $xml = $ar->toSignedXML();
+            $q = Utils::xpQuery($xml, '/samlp:AuthnRequest/samlp:RequestedAuthnContext');
+            $this->assertCount(0, $q);
+        }
+    }
+
+
+    /**
+     * Test that empty string AuthnContextClassRef in configuration is rejected.
+     */
+    public function testAuthnContextClassRefRejectsEmptyString(): void
+    {
+        $info = ['AuthId' => 'default-sp'];
+        $config = [
+            'entityID' => 'urn:x-simplesamlphp:example-sp',
+            'AuthnContextClassRef' => '',
+        ];
+        $as = new SpTester($info, $config);
+        $idpMetadata = new Configuration($this->idpConfigArray, 'test-idp');
+
+        $this->expectException(ConfigurationError::class);
+        $as->startSSO2Test($idpMetadata, []);
+    }
+
+
+    /**
      * Test Option A: when passAuthnContextClassRef is disabled, downstream RequestedAuthnContext
      * is ignored and the configured fallback ladder is preserved.
      */

@@ -19,7 +19,7 @@ $metadata['entity-id-2'] = [
 ## Options
 
 `AuthnContextClassRef`
-:   The AuthnContextClassRef that will be sent in the login request.
+:   The AuthnContextClassRef that will be sent in the login request. This can be a single string or an array of strings. Setting this option to an empty array (`[]`) indicates that no `RequestedAuthnContext` element should be sent for this IdP, overriding any default configured in the SP.
 
 :   When `AuthnContextClassRefFallback` is configured, `AuthnContextClassRef` must be a single non-empty string.
 
