@@ -1169,37 +1169,46 @@ class SAML2
             && isset($state['saml:sp:AuthnContext']);
 
         /*
-         * Downgrade Attack Mitigation (Truth in Assertion & Authorization Decoupling):
-         * A critical security control against downgrade attacks is ensuring downstream relying parties
-         * receive ground truth about the authentication actually performed.
-         * The RequestedAuthnContext sent upstream represents an initial preference during negotiation.
-         * If the upstream IdP stepped down to a weaker context (e.g. from phr to mfa or password), the
-         * downstream assertion MUST NOT falsely assert the higher requested assurance context.
+         * AuthnContextClassRef Resolution Precedence & Downgrade Mitigation:
          *
-         * Setting the assertion's AuthnContextClassRef to the context actually achieved upstream
-         * ($state['saml:sp:AuthnContext']) guarantees that downstream SPs and authproc filters make
-         * authorization decisions based on reality. Downstream security policies can inspect the returned
-         * assertion and reject inadequate assurance as appropriate.
+         * 1. Authproc Filter Output (Highest Priority):
+         *    Processing filters (e.g. saml:AuthnContextClassRef or custom mapping/step-up filters)
+         *    may transform, normalize, or explicitly set $state['saml:AuthnContextClassRef'].
+         *    Deliberate filter modifications take precedence over raw upstream assertion state.
+         *
+         * 2. Truth in Assertion & Downgrade Attack Mitigation (Proxy Flows):
+         *    When operating in fallback proxy mode ($isFallbackProxy) or passthrough mode
+         *    ($passAuthnContextClassRef) without explicit filter override, the downstream assertion
+         *    MUST reflect the context actually achieved upstream ($state['saml:sp:AuthnContext']).
+         *    The RequestedAuthnContext sent upstream represents only an initial preference during negotiation;
+         *    if the upstream IdP stepped down (e.g. from phr to mfa or password), the downstream assertion
+         *    must never falsely assert a higher requested assurance context.
+         *
+         * 3. Transport Defaults (Direct IdP Authentication):
+         *    If no filter or proxy state is present, default to PasswordProtectedTransport over HTTPS
+         *    or Password over unencrypted HTTP.
          */
-        if ($isFallbackProxy) {
-            $a->setAuthnContextClassRef($state['saml:sp:AuthnContext']);
-        } elseif (isset($state['saml:AuthnContextClassRef'])) {
+        if (isset($state['saml:AuthnContextClassRef'])) {
+            // 1. Authproc filter explicitly set or transformed the context: use filter output
             $a->setAuthnContextClassRef($state['saml:AuthnContextClassRef']);
-        } elseif ($passAuthnContextClassRef && isset($state['saml:sp:AuthnContext'])) {
-            // AuthnContext has been set by the upper IdP in front of the proxy, pass it back to the SP behind the proxy
+        } elseif (($isFallbackProxy || $passAuthnContextClassRef) && isset($state['saml:sp:AuthnContext'])) {
+            // 2. Fallback or passthrough proxy: pass the ground-truth context actually achieved from upstream IdP
             $a->setAuthnContextClassRef($state['saml:sp:AuthnContext']);
         } elseif ($httpUtils->isHTTPS()) {
+            // 3. Direct authentication over HTTPS: default to PasswordProtectedTransport
             $a->setAuthnContextClassRef(Constants::AC_PASSWORD_PROTECTED_TRANSPORT);
         } else {
+            // 4. Direct authentication over HTTP: default to Password
             $a->setAuthnContextClassRef(Constants::AC_PASSWORD);
         }
 
         $sessionStart = $now;
         if ($isFallbackProxy && isset($state['saml:AuthnInstant'])) {
+            // 1. Proxy fallback flows: preserve authentic upstream authentication instant from upstream IdP
             $a->setAuthnInstant($state['saml:AuthnInstant']);
             $sessionStart = $state['saml:AuthnInstant'];
         } elseif (isset($state['AuthnInstant'])) {
-            // Backwards-compatible key.
+            // 2. Legacy state key: support custom authproc filters or modules overriding AuthnInstant
             $a->setAuthnInstant($state['AuthnInstant']);
             $sessionStart = $state['AuthnInstant'];
         }

@@ -610,29 +610,6 @@ class SP extends Auth\Source
             return;
         }
 
-        /*
-         * Downgrade Attack Mitigation (Downstream Requirement Integrity):
-         * When passAuthnContextClassRef is enabled, an explicit RequestedAuthnContext supplied
-         * by a downstream SP takes absolute precedence over upstream IdP-remote and proxy SP policy,
-         * completely suppressing the fallback ladder. This ensures that a proxy can never silently
-         * step down or weaken a downstream SP's explicit security requirements.
-         * When passAuthnContextClassRef is disabled or unset, downstream SP context is completely ignored.
-         */
-        $downstreamContext = $state['saml:RequestedAuthnContext'] ?? null;
-        $validComparisonValues = array_column(AuthnContextComparisonTypeEnum::cases(), 'value');
-
-        if (
-            $this->passAuthnContextClassRef
-            && isset($downstreamContext['AuthnContextClassRef'], $downstreamContext['Comparison'])
-            && in_array($downstreamContext['Comparison'], $validComparisonValues, true)
-        ) {
-            $ar->setRequestedAuthnContext([
-                'AuthnContextClassRef' => $downstreamContext['AuthnContextClassRef'],
-                'Comparison' => $downstreamContext['Comparison'],
-            ]);
-            return;
-        }
-
         // Retrieve context and fallback arrays directly (null if unconfigured)
         $idpAccr = $idpMetadata->getOptionalValue('AuthnContextClassRef', null);
         $idpFallback = $idpMetadata->getOptionalArray('AuthnContextClassRefFallback', null);
@@ -737,6 +714,29 @@ class SP extends Auth\Source
             $ar->setRequestedAuthnContext([
                 'AuthnContextClassRef' => $accr,
                 'Comparison' => $comp,
+            ]);
+            return;
+        }
+
+        /*
+         * Proxy Passthrough (proxymode.passAuthnContextClassRef):
+         * If passAuthnContextClassRef is enabled, and no AuthnContextClassRef was configured on the IdP
+         * or SP ($accr === null), pass the downstream SP's RequestedAuthnContext directly through to the
+         * upstream IdP. When downstream context is passed through, neither AuthnContextClassRef nor
+         * AuthnContextClassRefFallback is used.
+         * If passAuthnContextClassRef is false or unset, downstream SP context is ignored.
+         */
+        $downstreamContext = $state['saml:RequestedAuthnContext'] ?? null;
+        $validComparisonValues = array_column(AuthnContextComparisonTypeEnum::cases(), 'value');
+
+        if (
+            $this->passAuthnContextClassRef
+            && isset($downstreamContext['AuthnContextClassRef'], $downstreamContext['Comparison'])
+            && in_array($downstreamContext['Comparison'], $validComparisonValues, true)
+        ) {
+            $ar->setRequestedAuthnContext([
+                'AuthnContextClassRef' => $downstreamContext['AuthnContextClassRef'],
+                'Comparison' => $downstreamContext['Comparison'],
             ]);
         }
     }

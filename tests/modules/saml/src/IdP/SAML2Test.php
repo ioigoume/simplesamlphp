@@ -6,6 +6,7 @@ namespace SimpleSAML\Test\Module\saml\IdP;
 
 use InvalidArgumentException;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
 use ReflectionMethod;
 use SAML2\Constants;
 use SimpleSAML\Configuration;
@@ -76,57 +77,138 @@ class SAML2Test extends ClearStateTestCase
     }
 
 
-    public function testProxyFallbackPrefersUpstreamAuthnContextClassRef(): void
-    {
-        $state = [
+    /**
+     * Test the complete resolution hierarchy for AuthnContextClassRef in buildAssertion.
+     *
+     * @param array $stateOverrides Overrides to apply to the authentication state array.
+     * @param array $configOverrides Overrides to apply to the global Configuration instance.
+     * @param string $baseUrlPath The base URL path to configure (http or https).
+     * @param string $expectedAuthnContext The expected AuthnContextClassRef on the generated assertion.
+     * @param int|null $expectedAuthnInstant The expected AuthnInstant timestamp, or null if unasserted.
+     */
+    #[DataProvider('provideAuthnContextResolutionScenarios')]
+    public function testAuthnContextResolutionHierarchy(
+        array $stateOverrides,
+        array $configOverrides,
+        string $baseUrlPath,
+        string $expectedAuthnContext,
+        ?int $expectedAuthnInstant = null,
+    ): void {
+        $config = array_merge([
+            'baseurlpath' => $baseUrlPath,
+        ], $configOverrides);
+
+        $globalConfig = Configuration::loadFromArray($config, '[ARRAY]', 'simplesaml');
+        Configuration::setPreLoadedConfig($globalConfig, 'config.php');
+
+        if (str_starts_with($baseUrlPath, 'https://')) {
+            $_SERVER['HTTPS'] = 'on';
+        } else {
+            $_SERVER['HTTPS'] = 'off';
+        }
+
+        $state = array_merge([
             'Attributes' => [],
             'saml:ConsumerURL' => 'https://sp.example/acs',
             'saml:Binding' => Constants::BINDING_HTTP_POST,
             'saml:RequestId' => 'request-id',
             'IdPMetadata' => ['entityid' => 'https://idp.example'],
-
-            // Proxy state from upstream IdP.
-            'saml:sp:AuthnContext' => 'https://refeds.org/profile/mfa',
-            'saml:AuthnInstant' => 1234567890,
-
-            // Proxy requested context and ladder.
-            'saml:AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
-            'saml:AuthnContextClassRefFallback' => [
-                'https://refeds.org/profile/mfa/phr',
-                'https://refeds.org/profile/mfa',
-                '',
-            ],
-        ];
+        ], $stateOverrides);
 
         $assertion = $this->buildAssertionForState($state);
-        $this->assertSame('https://refeds.org/profile/mfa', $assertion->getAuthnContextClassRef());
-        $this->assertSame(1234567890, $assertion->getAuthnInstant());
+        $this->assertSame($expectedAuthnContext, $assertion->getAuthnContextClassRef());
+        if ($expectedAuthnInstant !== null) {
+            $this->assertSame($expectedAuthnInstant, $assertion->getAuthnInstant());
+        }
     }
 
 
-    public function testProxyFallbackFirstRungPassesUpstreamAuthnContextAndInstant(): void
+    /**
+     * Data provider for AuthnContextClassRef resolution hierarchy in buildAssertion.
+     *
+     * @return array<string, array{
+     *     stateOverrides: array,
+     *     configOverrides: array,
+     *     baseUrlPath: string,
+     *     expectedAuthnContext: string,
+     *     expectedAuthnInstant?: ?int
+     * }>
+     */
+    public static function provideAuthnContextResolutionScenarios(): array
     {
-        $state = [
-            'Attributes' => [],
-            'saml:ConsumerURL' => 'https://sp.example/acs',
-            'saml:Binding' => Constants::BINDING_HTTP_POST,
-            'saml:RequestId' => 'request-id',
-            'IdPMetadata' => ['entityid' => 'https://idp.example'],
-
-            'saml:sp:AuthnContext' => 'https://refeds.org/profile/mfa/phr',
-            'saml:AuthnInstant' => 1234567891,
-
-            'saml:AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
-            'saml:AuthnContextClassRefFallback' => [
-                'https://refeds.org/profile/mfa/phr',
-                'https://refeds.org/profile/mfa',
-                '',
+        return [
+            'Tier 1: Authproc filter overrides proxy state' => [
+                'stateOverrides' => [
+                    'saml:sp:AuthnContext' => 'https://refeds.org/profile/mfa',
+                    'saml:AuthnInstant' => 1234567890,
+                    'saml:AuthnContextClassRef' => 'https://custom.example.org/authproc-context',
+                    'saml:AuthnContextClassRefFallback' => [
+                        'https://refeds.org/profile/mfa/phr',
+                        'https://refeds.org/profile/mfa',
+                        '',
+                    ],
+                ],
+                'configOverrides' => [],
+                'baseUrlPath' => 'https://example.org/simplesaml/',
+                'expectedAuthnContext' => 'https://custom.example.org/authproc-context',
+                'expectedAuthnInstant' => 1234567890,
+            ],
+            'Tier 2a: Fallback proxy emits upstream achieved context' => [
+                'stateOverrides' => [
+                    'saml:sp:AuthnContext' => 'https://refeds.org/profile/mfa',
+                    'saml:AuthnInstant' => 1234567890,
+                    'saml:AuthnContextClassRefFallback' => [
+                        'https://refeds.org/profile/mfa/phr',
+                        'https://refeds.org/profile/mfa',
+                        '',
+                    ],
+                ],
+                'configOverrides' => [],
+                'baseUrlPath' => 'https://example.org/simplesaml/',
+                'expectedAuthnContext' => 'https://refeds.org/profile/mfa',
+                'expectedAuthnInstant' => 1234567890,
+            ],
+            'Tier 2b: Fallback proxy first rung passes upstream achieved context' => [
+                'stateOverrides' => [
+                    'saml:sp:AuthnContext' => 'https://refeds.org/profile/mfa/phr',
+                    'saml:AuthnInstant' => 1234567891,
+                    'saml:AuthnContextClassRefFallback' => [
+                        'https://refeds.org/profile/mfa/phr',
+                        'https://refeds.org/profile/mfa',
+                        '',
+                    ],
+                ],
+                'configOverrides' => [],
+                'baseUrlPath' => 'https://example.org/simplesaml/',
+                'expectedAuthnContext' => 'https://refeds.org/profile/mfa/phr',
+                'expectedAuthnInstant' => 1234567891,
+            ],
+            'Tier 2c: Passthrough proxy emits upstream achieved context' => [
+                'stateOverrides' => [
+                    'saml:sp:AuthnContext' => 'https://refeds.org/profile/mfa',
+                ],
+                'configOverrides' => [
+                    'proxymode.passAuthnContextClassRef' => true,
+                ],
+                'baseUrlPath' => 'https://example.org/simplesaml/',
+                'expectedAuthnContext' => 'https://refeds.org/profile/mfa',
+                'expectedAuthnInstant' => null,
+            ],
+            'Tier 3: Direct authentication over HTTPS defaults to PasswordProtectedTransport' => [
+                'stateOverrides' => [],
+                'configOverrides' => [],
+                'baseUrlPath' => 'https://example.org/simplesaml/',
+                'expectedAuthnContext' => Constants::AC_PASSWORD_PROTECTED_TRANSPORT,
+                'expectedAuthnInstant' => null,
+            ],
+            'Tier 4: Direct authentication over HTTP defaults to Password' => [
+                'stateOverrides' => [],
+                'configOverrides' => [],
+                'baseUrlPath' => 'http://example.org/simplesaml/',
+                'expectedAuthnContext' => Constants::AC_PASSWORD,
+                'expectedAuthnInstant' => null,
             ],
         ];
-
-        $assertion = $this->buildAssertionForState($state);
-        $this->assertSame('https://refeds.org/profile/mfa/phr', $assertion->getAuthnContextClassRef());
-        $this->assertSame(1234567891, $assertion->getAuthnInstant());
     }
 
 

@@ -643,7 +643,8 @@ class SPTest extends ClearStateTestCase
 
 
     /**
-     * Test absent-context gating: explicit downstream RequestedAuthnContext suppresses fallback initialization.
+     * Test absent-context gating: when passAuthnContextClassRef is true and AuthnContextClassRef is null,
+     * explicit downstream RequestedAuthnContext is used and no fallback ladder is initialized.
      */
     public function testAuthnContextClassRefFallbackGatedByDownstreamRequestedContext(): void
     {
@@ -651,8 +652,6 @@ class SPTest extends ClearStateTestCase
         $config = [
             'entityID' => 'urn:x-simplesamlphp:example-sp',
             'proxymode.passAuthnContextClassRef' => true,
-            'AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
-            'AuthnContextClassRefFallback' => ['https://refeds.org/profile/mfa', ''],
         ];
         $as = new SpTester($info, $config);
         $idpMetadata = new Configuration($this->idpConfigArray, 'test-idp');
@@ -679,6 +678,43 @@ class SPTest extends ClearStateTestCase
 
             $savedState = \SimpleSAML\Auth\State::loadState($ar->getId(), 'saml:sp:sso');
             $this->assertArrayNotHasKey('saml:AuthnContextClassRefFallback', $savedState);
+        }
+    }
+
+
+    /**
+     * Test that when passAuthnContextClassRef is true but AuthnContextClassRef is configured,
+     * the configured AuthnContextClassRef takes precedence over downstream RequestedAuthnContext.
+     */
+    public function testPassAuthnContextClassRefPrefersConfiguredAuthnContextClassRef(): void
+    {
+        $info = ['AuthId' => 'default-sp'];
+        $config = [
+            'entityID' => 'urn:x-simplesamlphp:example-sp',
+            'proxymode.passAuthnContextClassRef' => true,
+            'AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+        ];
+        $as = new SpTester($info, $config);
+        $idpMetadata = new Configuration($this->idpConfigArray, 'test-idp');
+
+        $state = [
+            'saml:RequestedAuthnContext' => [
+                'AuthnContextClassRef' => ['urn:downstream:explicit'],
+                'Comparison' => 'minimum',
+            ],
+        ];
+
+        try {
+            $as->startSSO2Test($idpMetadata, $state);
+            $this->fail('Expected ExitTestException');
+        } catch (ExitTestException $e) {
+            $r = $e->getTestResult();
+            /** @var \SAML2\AuthnRequest $ar */
+            $ar = $r['ar'];
+
+            $requestedContext = $ar->getRequestedAuthnContext();
+            $this->assertIsArray($requestedContext);
+            $this->assertEquals(['https://refeds.org/profile/mfa/phr'], $requestedContext['AuthnContextClassRef']);
         }
     }
 
@@ -858,6 +894,414 @@ class SPTest extends ClearStateTestCase
 
         $this->expectException(AssertionFailedException::class);
         $as->startSSO2Test($idpMetadata, []);
+    }
+
+
+    /**
+     * Test the comprehensive AuthnContextClassRef specification rules, precedence behaviors, and fallback scenarios.
+     *
+     * @param array $spConfig SP AuthSource configuration options.
+     * @param array $idpConfigOverrides Overrides to apply to the IdP remote metadata configuration.
+     * @param array $state Initial authentication state.
+     * @param array|null $expectedRequestedAuthnContext Expected RequestedAuthnContext array on the AuthnRequest,
+     *                                                  or null if no element is expected.
+     * @param array|null $expectedFallbackState Expected fallback ladder in saved state, or null if none expected.
+     * @param class-string<\Throwable>|null $expectedExceptionClass Expected exception class if a failure is expected.
+     */
+    #[DataProvider('provideAuthnContextClassRefScenarios')]
+    public function testAuthnContextClassRefScenarios(
+        array $spConfig,
+        array $idpConfigOverrides,
+        array $state,
+        ?array $expectedRequestedAuthnContext,
+        ?array $expectedFallbackState,
+        ?string $expectedExceptionClass = null,
+    ): void {
+        $info = ['AuthId' => 'default-sp'];
+        $as = new SpTester($info, $spConfig);
+        $idpConfig = array_merge($this->idpConfigArray, $idpConfigOverrides);
+        $idpMetadata = new Configuration($idpConfig, 'test-idp');
+
+        if ($expectedExceptionClass !== null) {
+            $this->expectException($expectedExceptionClass);
+            $as->startSSO2Test($idpMetadata, $state);
+            return;
+        }
+
+        try {
+            $as->startSSO2Test($idpMetadata, $state);
+            $this->fail('Expected ExitTestException');
+        } catch (ExitTestException $e) {
+            $r = $e->getTestResult();
+            /** @var \SAML2\AuthnRequest $ar */
+            $ar = $r['ar'];
+
+            $requestedContext = $ar->getRequestedAuthnContext();
+            if ($expectedRequestedAuthnContext === null) {
+                $this->assertNull($requestedContext);
+            } else {
+                $this->assertIsArray($requestedContext);
+                $this->assertEquals(
+                    $expectedRequestedAuthnContext['AuthnContextClassRef'],
+                    $requestedContext['AuthnContextClassRef'],
+                );
+                if (isset($expectedRequestedAuthnContext['Comparison'])) {
+                    $this->assertEquals(
+                        $expectedRequestedAuthnContext['Comparison'],
+                        $requestedContext['Comparison'],
+                    );
+                }
+            }
+
+            $savedState = \SimpleSAML\Auth\State::loadState($ar->getId(), 'saml:sp:sso');
+            if ($expectedFallbackState === null) {
+                $this->assertArrayNotHasKey('saml:AuthnContextClassRefFallback', $savedState);
+            } else {
+                $this->assertArrayHasKey('saml:AuthnContextClassRefFallback', $savedState);
+                $this->assertEquals($expectedFallbackState, $savedState['saml:AuthnContextClassRefFallback']);
+            }
+        }
+    }
+
+
+    /**
+     * Data provider for AuthnContextClassRef resolution, precedence, and fallback scenarios.
+     *
+     * @return array<string, array{
+     *     spConfig: array,
+     *     idpConfigOverrides: array,
+     *     state: array,
+     *     expectedRequestedAuthnContext: ?array,
+     *     expectedFallbackState: ?array,
+     *     expectedExceptionClass?: ?string
+     * }>
+     */
+    public static function provideAuthnContextClassRefScenarios(): array
+    {
+        return [
+            // 1. Allow saml20-idp-remote.php AuthnContextClassRef to be an array or string
+            '1a. IdP metadata string AuthnContextClassRef' => [
+                'spConfig' => ['entityID' => 'urn:x-simplesamlphp:example-sp'],
+                'idpConfigOverrides' => [
+                    'AuthnContextClassRef' => 'urn:oasis:names:tc:SAML:2.0:ac:classes:X509',
+                ],
+                'state' => [],
+                'expectedRequestedAuthnContext' => [
+                    'AuthnContextClassRef' => ['urn:oasis:names:tc:SAML:2.0:ac:classes:X509'],
+                    'Comparison' => 'exact',
+                ],
+                'expectedFallbackState' => null,
+            ],
+            '1b. IdP metadata array AuthnContextClassRef' => [
+                'spConfig' => ['entityID' => 'urn:x-simplesamlphp:example-sp'],
+                'idpConfigOverrides' => [
+                    'AuthnContextClassRef' => [
+                        'urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport',
+                        'urn:oasis:names:tc:SAML:2.0:ac:classes:X509',
+                    ],
+                ],
+                'state' => [],
+                'expectedRequestedAuthnContext' => [
+                    'AuthnContextClassRef' => [
+                        'urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport',
+                        'urn:oasis:names:tc:SAML:2.0:ac:classes:X509',
+                    ],
+                    'Comparison' => 'exact',
+                ],
+                'expectedFallbackState' => null,
+            ],
+
+            // 2. Filter AuthnContextClassRef for any empty strings
+            '2a. SP AuthnContextClassRef rejects empty string' => [
+                'spConfig' => [
+                    'entityID' => 'urn:x-simplesamlphp:example-sp',
+                    'AuthnContextClassRef' => '',
+                ],
+                'idpConfigOverrides' => [],
+                'state' => [],
+                'expectedRequestedAuthnContext' => null,
+                'expectedFallbackState' => null,
+                'expectedExceptionClass' => ConfigurationError::class,
+            ],
+            '2b. SP AuthnContextClassRef array rejects empty string element' => [
+                'spConfig' => [
+                    'entityID' => 'urn:x-simplesamlphp:example-sp',
+                    'AuthnContextClassRef' => ['urn:oasis:names:tc:SAML:2.0:ac:classes:Password', ''],
+                ],
+                'idpConfigOverrides' => [],
+                'state' => [],
+                'expectedRequestedAuthnContext' => null,
+                'expectedFallbackState' => null,
+                'expectedExceptionClass' => ConfigurationError::class,
+            ],
+            '2c. IdP AuthnContextClassRef rejects empty string' => [
+                'spConfig' => ['entityID' => 'urn:x-simplesamlphp:example-sp'],
+                'idpConfigOverrides' => [
+                    'AuthnContextClassRef' => '',
+                ],
+                'state' => [],
+                'expectedRequestedAuthnContext' => null,
+                'expectedFallbackState' => null,
+                'expectedExceptionClass' => ConfigurationError::class,
+            ],
+            '2d. IdP AuthnContextClassRef array rejects empty string element' => [
+                'spConfig' => ['entityID' => 'urn:x-simplesamlphp:example-sp'],
+                'idpConfigOverrides' => [
+                    'AuthnContextClassRef' => ['urn:oasis:names:tc:SAML:2.0:ac:classes:Password', ''],
+                ],
+                'state' => [],
+                'expectedRequestedAuthnContext' => null,
+                'expectedFallbackState' => null,
+                'expectedExceptionClass' => ConfigurationError::class,
+            ],
+
+            // 3. If AuthnContextClassRef is an empty array, indicate do not send AuthnContextClassRef
+            '3a. IdP AuthnContextClassRef empty array suppresses context overriding SP default' => [
+                'spConfig' => [
+                    'entityID' => 'urn:x-simplesamlphp:example-sp',
+                    'AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+                ],
+                'idpConfigOverrides' => [
+                    'AuthnContextClassRef' => [],
+                ],
+                'state' => [],
+                'expectedRequestedAuthnContext' => null,
+                'expectedFallbackState' => null,
+            ],
+            '3b. SP AuthnContextClassRef empty array suppresses context' => [
+                'spConfig' => [
+                    'entityID' => 'urn:x-simplesamlphp:example-sp',
+                    'AuthnContextClassRef' => [],
+                ],
+                'idpConfigOverrides' => [],
+                'state' => [],
+                'expectedRequestedAuthnContext' => null,
+                'expectedFallbackState' => null,
+            ],
+            '3c. State AuthnContextClassRef empty array suppresses context' => [
+                'spConfig' => [
+                    'entityID' => 'urn:x-simplesamlphp:example-sp',
+                    'AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+                ],
+                'idpConfigOverrides' => [],
+                'state' => [
+                    'saml:AuthnContextClassRef' => [],
+                ],
+                'expectedRequestedAuthnContext' => null,
+                'expectedFallbackState' => null,
+            ],
+
+            // 4. If AuthnContextClassRef is null, look at other sources of that setting
+            '4a. IdP null falls back to state AuthnContextClassRef over SP default' => [
+                'spConfig' => [
+                    'entityID' => 'urn:x-simplesamlphp:example-sp',
+                    'AuthnContextClassRef' => 'urn:sp:default',
+                ],
+                'idpConfigOverrides' => [],
+                'state' => [
+                    'saml:AuthnContextClassRef' => ['urn:state:custom'],
+                    'saml:AuthnContextComparison' => 'better',
+                ],
+                'expectedRequestedAuthnContext' => [
+                    'AuthnContextClassRef' => ['urn:state:custom'],
+                    'Comparison' => 'better',
+                ],
+                'expectedFallbackState' => null,
+            ],
+            '4b. IdP null and state null falls back to SP authsource default' => [
+                'spConfig' => [
+                    'entityID' => 'urn:x-simplesamlphp:example-sp',
+                    'AuthnContextClassRef' => 'urn:sp:default',
+                    'AuthnContextComparison' => 'minimum',
+                ],
+                'idpConfigOverrides' => [],
+                'state' => [],
+                'expectedRequestedAuthnContext' => [
+                    'AuthnContextClassRef' => ['urn:sp:default'],
+                    'Comparison' => 'minimum',
+                ],
+                'expectedFallbackState' => null,
+            ],
+
+            // 5. If AuthnContextClassRef is null or an empty array, no AuthnContextClassRefFallback settings are used
+            '5a. SP fallback configured without initial AuthnContextClassRef throws ConfigurationError' => [
+                'spConfig' => [
+                    'entityID' => 'urn:x-simplesamlphp:example-sp',
+                    'AuthnContextClassRefFallback' => ['https://refeds.org/profile/mfa', ''],
+                ],
+                'idpConfigOverrides' => [],
+                'state' => [],
+                'expectedRequestedAuthnContext' => null,
+                'expectedFallbackState' => null,
+                'expectedExceptionClass' => ConfigurationError::class,
+            ],
+            '5b. IdP fallback configured without initial AuthnContextClassRef throws ConfigurationError' => [
+                'spConfig' => ['entityID' => 'urn:x-simplesamlphp:example-sp'],
+                'idpConfigOverrides' => [
+                    'AuthnContextClassRefFallback' => ['https://refeds.org/profile/mfa', ''],
+                ],
+                'state' => [],
+                'expectedRequestedAuthnContext' => null,
+                'expectedFallbackState' => null,
+                'expectedExceptionClass' => ConfigurationError::class,
+            ],
+            '5c. SP fallback configured with empty array AuthnContextClassRef throws ConfigurationError' => [
+                'spConfig' => [
+                    'entityID' => 'urn:x-simplesamlphp:example-sp',
+                    'AuthnContextClassRef' => [],
+                    'AuthnContextClassRefFallback' => ['https://refeds.org/profile/mfa', ''],
+                ],
+                'idpConfigOverrides' => [],
+                'state' => [],
+                'expectedRequestedAuthnContext' => null,
+                'expectedFallbackState' => null,
+                'expectedExceptionClass' => ConfigurationError::class,
+            ],
+            '5d. IdP fallback configured with empty array AuthnContextClassRef throws ConfigurationError' => [
+                'spConfig' => ['entityID' => 'urn:x-simplesamlphp:example-sp'],
+                'idpConfigOverrides' => [
+                    'AuthnContextClassRef' => [],
+                    'AuthnContextClassRefFallback' => ['https://refeds.org/profile/mfa', ''],
+                ],
+                'state' => [],
+                'expectedRequestedAuthnContext' => null,
+                'expectedFallbackState' => null,
+                'expectedExceptionClass' => ConfigurationError::class,
+            ],
+
+            // 6. If AuthnContextClassRef is a non-empty array/string, evaluate
+            //    AuthnContextClassRefFallback on IdP, then SP
+            '6a. IdP context and IdP fallback ladder used atomically overriding SP defaults' => [
+                'spConfig' => [
+                    'entityID' => 'urn:x-simplesamlphp:example-sp',
+                    'AuthnContextClassRef' => 'urn:sp:initial',
+                    'AuthnContextClassRefFallback' => ['urn:sp:fallback', ''],
+                ],
+                'idpConfigOverrides' => [
+                    'AuthnContextClassRef' => 'urn:idp:initial',
+                    'AuthnContextClassRefFallback' => ['urn:idp:fallback', ''],
+                ],
+                'state' => [],
+                'expectedRequestedAuthnContext' => [
+                    'AuthnContextClassRef' => ['urn:idp:initial'],
+                    'Comparison' => 'exact',
+                ],
+                'expectedFallbackState' => ['urn:idp:fallback', ''],
+            ],
+            '6b. IdP context with explicit empty fallback array disables retries' => [
+                'spConfig' => [
+                    'entityID' => 'urn:x-simplesamlphp:example-sp',
+                    'AuthnContextClassRef' => 'urn:sp:initial',
+                    'AuthnContextClassRefFallback' => ['urn:sp:fallback', ''],
+                ],
+                'idpConfigOverrides' => [
+                    'AuthnContextClassRef' => 'urn:idp:initial',
+                    'AuthnContextClassRefFallback' => [],
+                ],
+                'state' => [],
+                'expectedRequestedAuthnContext' => [
+                    'AuthnContextClassRef' => ['urn:idp:initial'],
+                    'Comparison' => 'exact',
+                ],
+                'expectedFallbackState' => null,
+            ],
+            '6c. SP context and SP fallback ladder used when IdP unconfigured' => [
+                'spConfig' => [
+                    'entityID' => 'urn:x-simplesamlphp:example-sp',
+                    'AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+                    'AuthnContextClassRefFallback' => ['https://refeds.org/profile/mfa', ''],
+                ],
+                'idpConfigOverrides' => [],
+                'state' => [],
+                'expectedRequestedAuthnContext' => [
+                    'AuthnContextClassRef' => ['https://refeds.org/profile/mfa/phr'],
+                    'Comparison' => 'exact',
+                ],
+                'expectedFallbackState' => ['https://refeds.org/profile/mfa', ''],
+            ],
+
+            // 7. If passAuthnContextClassRef is false, ignore
+            //    $state['saml:RequestedAuthnContext']['AuthnContextClassRef']
+            '7a. passAuthnContextClassRef false ignores downstream context and uses SP ladder' => [
+                'spConfig' => [
+                    'entityID' => 'urn:x-simplesamlphp:example-sp',
+                    'proxymode.passAuthnContextClassRef' => false,
+                    'AuthnContextClassRef' => 'https://refeds.org/profile/mfa/phr',
+                    'AuthnContextClassRefFallback' => ['https://refeds.org/profile/mfa', ''],
+                ],
+                'idpConfigOverrides' => [],
+                'state' => [
+                    'saml:RequestedAuthnContext' => [
+                        'AuthnContextClassRef' => ['urn:downstream:ignored'],
+                        'Comparison' => 'minimum',
+                    ],
+                ],
+                'expectedRequestedAuthnContext' => [
+                    'AuthnContextClassRef' => ['https://refeds.org/profile/mfa/phr'],
+                    'Comparison' => 'exact',
+                ],
+                'expectedFallbackState' => ['https://refeds.org/profile/mfa', ''],
+            ],
+
+            // 8. If passAuthnContextClassRef is true, use downstream context ONLY if AuthnContextClassRef is null
+            '8a. passAuthnContextClassRef true uses downstream context when AuthnContextClassRef is null' => [
+                'spConfig' => [
+                    'entityID' => 'urn:x-simplesamlphp:example-sp',
+                    'proxymode.passAuthnContextClassRef' => true,
+                ],
+                'idpConfigOverrides' => [],
+                'state' => [
+                    'saml:RequestedAuthnContext' => [
+                        'AuthnContextClassRef' => ['urn:downstream:explicit'],
+                        'Comparison' => 'better',
+                    ],
+                ],
+                'expectedRequestedAuthnContext' => [
+                    'AuthnContextClassRef' => ['urn:downstream:explicit'],
+                    'Comparison' => 'better',
+                ],
+                'expectedFallbackState' => null,
+            ],
+            '8b. passAuthnContextClassRef true prefers configured SP AuthnContextClassRef over downstream context' => [
+                'spConfig' => [
+                    'entityID' => 'urn:x-simplesamlphp:example-sp',
+                    'proxymode.passAuthnContextClassRef' => true,
+                    'AuthnContextClassRef' => 'urn:sp:configured',
+                ],
+                'idpConfigOverrides' => [],
+                'state' => [
+                    'saml:RequestedAuthnContext' => [
+                        'AuthnContextClassRef' => ['urn:downstream:ignored'],
+                        'Comparison' => 'minimum',
+                    ],
+                ],
+                'expectedRequestedAuthnContext' => [
+                    'AuthnContextClassRef' => ['urn:sp:configured'],
+                    'Comparison' => 'exact',
+                ],
+                'expectedFallbackState' => null,
+            ],
+            '8c. passAuthnContextClassRef true prefers configured IdP AuthnContextClassRef over downstream context' => [
+                'spConfig' => [
+                    'entityID' => 'urn:x-simplesamlphp:example-sp',
+                    'proxymode.passAuthnContextClassRef' => true,
+                ],
+                'idpConfigOverrides' => [
+                    'AuthnContextClassRef' => 'urn:idp:configured',
+                ],
+                'state' => [
+                    'saml:RequestedAuthnContext' => [
+                        'AuthnContextClassRef' => ['urn:downstream:ignored'],
+                        'Comparison' => 'minimum',
+                    ],
+                ],
+                'expectedRequestedAuthnContext' => [
+                    'AuthnContextClassRef' => ['urn:idp:configured'],
+                    'Comparison' => 'exact',
+                ],
+                'expectedFallbackState' => null,
+            ],
+        ];
     }
 
 
